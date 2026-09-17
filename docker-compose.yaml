@@ -1,0 +1,27 @@
+services:
+  sayteacher-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sayteacher-api
+    restart: always
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CONNECT=${CONNECT:-127.0.0.1:16050}
+      - PASSWORD=${PASSWORD:-}
+      - MODEL=${MODEL:-bond005/whisper-podlodka-turbo}
+      - LANGUAGE=${LANGUAGE:-English}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - LLM_API=${LLM_API:-}
+      - LOGLEVEL=${LOGLEVEL:-INFO}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+              count: all
+    # HF model (~3 GB) + silero TTS bundles cache; persists across container rebuilds.
+    # The image runs as root, so HOME=/root and the cache lands under /root/.cache.
+    volumes:
+      - ./data-sayteacher:/root/.cache

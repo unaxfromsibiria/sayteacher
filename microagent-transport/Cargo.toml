@@ -1,0 +1,18 @@
+[package]
+name = "microagent-transport"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib", "cdylib"] 
+
+[dependencies]
+log = { version = "~0.4", features = ["std", "serde"] }
+env_logger = "~0.11"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+futures-util = { version = "0.3", features = ["sink"] }
+sha2 = "~0.11"
+hex = "0.4"

@@ -1,0 +1,16 @@
+.git/
+.venv
+venv/
+target/
+microagent/target/
+*.pyc
+__pycache__/
+.pytest_cache/
+.kilo/
+examples/
+files/
+latest_silero_models.yml
+sayteacher/tests/
+sayteacher/__pycache__/
+Dockerfile
+.dockerignore

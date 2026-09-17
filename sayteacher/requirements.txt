@@ -1,0 +1,10 @@
+click==8.5.0
+librosa==1
+huggingface_hub
+transformers
+torch==2.14.0
+whisper-lid
+accelerate
+ollama==0.6.2
+silero==0.5.5
+iso3166
