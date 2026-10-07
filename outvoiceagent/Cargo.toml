@@ -1,0 +1,18 @@
+[package]
+name = "outvoiceagent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# aptitude install clang libclang-dev libpipewire-0.3-dev
+cpal = { version = "~0.18", default-features = false, features = ["pipewire", "pulseaudio"] }
+eframe = "~0.36"
+egui = "~0.36"
+hound = "~3.5"
+log = { version = "~0.4", features = ["std", "serde"] }
+env_logger = "~0.11"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = { version = "0.3", features = ["sink"] }
+
+microagent-transport = { path = "../microagent-transport" }

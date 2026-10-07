@@ -47,6 +47,32 @@ You can serve any of the quantized GGUF models with [llama.cpp](https://github.c
 
 Then point `--llm-api` at the server (`http://localhost:8080/v1`) and `--llm-model` at the model file.
 
+## Live subtitles for movies, podcasts, and conversations
+
+Beyond one-on-one practice with an LLM teacher, you can follow along with any English audio - a movie, a TV show, a podcast, or a conversation with a native speaker. Two additional components handle this:
+
+- **outvoiceagent** - a small transparent overlay that captures your system's audio output (loopback) and displays translated text scrolling like subtitles.
+- **transcreenpt** - a background service performing speech recognition (faster-whisper) and real-time translation into the target language of your choice. Multiple languages are supported.
+
+Together they turn any English audio into live bilingual subtitles on your screen.
+
+![German subtitles](files/tr_deu.jpg)
+
+![Spanish subtitles](files/tr_spa.jpg)
+
+### Running
+
+```bash
+# Terminal 1 - subtitle overlay (captures system audio, displays translated text)
+cd outvoiceagent
+RUST_LOG=info cargo run -- --listen 0.0.0.0:16050 --device auto --delay 4.5
+
+# Terminal 2 - recognition + translation service
+HF_HUB_OFFLINE=1 python -m transcreenpt.main --model 'distil-medium.en' --debug --tolang german --parallel 2
+```
+
+Both support `--help` for the full list of options (target language, model, parallelism, etc.).
+
 ## Starting with Docker
 
 Startup works as usual - fill in the environment variables in `docker-compose.yaml` and start it:

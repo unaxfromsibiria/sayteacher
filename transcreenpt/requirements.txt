@@ -1,0 +1,10 @@
+click==8.5.0
+librosa==1
+huggingface_hub
+transformers
+torch==2.14.0
+accelerate
+iso3166
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+faster-whisper==1.2.1
