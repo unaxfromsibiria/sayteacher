@@ -1,19 +1,16 @@
 import asyncio
-import inspect
 import io
 import json
 import logging
 import os
 import struct
+import time
 import wave
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
-from typing import Callable
 
 import numpy as np
-import torch
-from ollama import AsyncClient
-from silero import silero_tts
-from torchaudio.transforms import Resample
+from openai import AsyncOpenAI
 
 try:  # `python -m sayteacher.service` (package mode)
     from .common import DEFAULT_BUNDLE_BY_LANG
@@ -42,104 +39,108 @@ except ImportError:  # flat run / pytest bootstrap
 
 log = logging.getLogger("sayteacher")
 
-
-# Loaded silero models, one per speaker id; avoids re-reading the .pt cache per service.
-_MODEL_CACHE: dict[str, object] = {}
-
 # Model bundle ids Silero supports; a static snapshot of the official models.yml shipped
 # in silero_models.py (no runtime file read / OmegaConf needed). We only use membership to
 # tell --speaker voice ids apart from bundle ids — silero_tts() downloads on demand.
 _KNOWN_BUNDLE_IDS: frozenset[str] = known_bundle_ids()
 
+# Per-worker-process cache of loaded ASR models, keyed by (model, device, compute_type).
+_WHISPER_CACHE: dict[tuple, object] = {}
 
-class TtsService:
-    """Synthesize teacher speech (Silero v3 model) into 16 kHz mono f32 LE bytes.
+# Per-worker-process cache of loaded TTS models, keyed by (bundle, voice, language).
+_TTS_CACHE: dict[tuple, object] = {}
 
-    The Rust client resamples playback back to its output device rate from this rate;
-    the transport audio field is little-endian float32, matching SpeechClip encoding.
-    """
 
-    def __init__(self, lang: str, speaker: str) -> None:
-        self.speaker = (speaker or "").strip()
-        self.language_code = silero_language(lang)
-        if self.enabled and self.language_code == "auto":
-            log.warning("tts: unknown --lang %r; Silero language will be derived from the speaker id", lang)
+def _worker_transcribe(model: str, lang: str | None, samples: np.ndarray) -> str:
+    """Runs in a worker process: load/cache the faster-whisper model and transcribe samples.
 
-        self._voice = "" if self.speaker in _KNOWN_BUNDLE_IDS else self.speaker
+    Module-level so it is picklable for ProcessPoolExecutor; only settings and the numpy
+    samples cross the process boundary, never the service instance."""
+    try:
+        import torch
+        from faster_whisper import WhisperModel
+    except Exception as e:
+        log.error("failed to import ASR deps for %s: %s", model, e)
+        return ""
 
-        self._model = None
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "float16"
+    key = (model, device, compute_type)
+    pipe = _WHISPER_CACHE.get(key)
+    if pipe is None:
+        try:
+            pipe = WhisperModel(model, device=device, compute_type=compute_type)
+        except Exception as e:
+            log.error("failed to load ASR model %s: %s", model, e)
+            return ""
+        _WHISPER_CACHE[key] = pipe
+        log.info("ASR model loaded %s (device=%s compute=%s)", model, device, compute_type)
 
-    @property
-    def enabled(self) -> bool:
-        return bool(self.speaker) or self.language_code != "auto"
+    kwargs: dict = {"beam_size": 1}
+    if lang:
+        kwargs["language"] = lang
 
-    def _resolve_language(self) -> str:
-        """Language key for silero_tts; falls back from a bundle id, else 'en'."""
-        if self.language_code != "auto":
-            return self.language_code
-        return SPEAKER_LANG_HINT.get(self.speaker, "en")
+    try:
+        segments, info = pipe.transcribe(samples, **kwargs)
+        return " ".join(seg.text.strip() for seg in segments).strip()
+    except Exception as e:
+        log.warning("transcribe error: %s", e)
+        return ""
 
-    def _load_model(self):
-        if not self.enabled or self._model is not None:
-            return self._model
 
-        language = self._resolve_language()
-        # --speaker may be a bundle id (v3_en, v5_ru ...) or a voice id (en_117, xenia ...).
-        # silero_tts(language=..., speaker=<bundle>) needs the *model* to download/load and
-        # asserts it belongs to `language`, so we distinguish by bundle-id membership.
-        if self.speaker and self.speaker in _KNOWN_BUNDLE_IDS:
-            bundle = self.speaker
+def _worker_tts(bundle: str, voice: str, language: str, text: str) -> bytes:
+    """Runs in a worker process: load/cache the Silero TTS model and synthesize speech.
+
+    Returns 16 kHz mono f32 LE bytes; b"" on empty input or failure."""
+    if not text:
+        return b""
+
+    try:
+        import torch
+        from silero import silero_tts
+        from torchaudio.transforms import Resample
+    except Exception as e:
+        log.error("failed to import TTS deps: %s", e)
+        return b""
+
+    key = (bundle, voice, language)
+    model = _TTS_CACHE.get(key)
+    if model is None:
+        try:
+            loaded = silero_tts(language=language, speaker=bundle)
+            if isinstance(loaded, tuple) and loaded:
+                model = loaded[0]
+            else:  # pragma: no cover - unexpected silero version layout
+                raise RuntimeError(f"unexpected silero_tts result type: {type(loaded)!r}")
+        except Exception as e:
+            log.error("failed to load TTS model %s: %s", bundle, e)
+            return b""
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+        _TTS_CACHE[key] = model
+        log.info("tts: loaded %s (voice=%s) on %s", bundle, voice or "(default)", device.type)
+
+    try:
+        voices = getattr(model, "speakers", None)
+        if isinstance(voices, (list, tuple)) and voices:
+            speaker = str(voice) if voice else sorted(str(v) for v in voices)[0]
+            audio = model.apply_tts(text=text, speaker=speaker, sample_rate=24_000)
+            source_rate = 24_000
         else:
-            bundle = DEFAULT_BUNDLE_BY_LANG.get(language, "v3_en")
+            audio = model.apply_tts(text=text, sample_rate=16_000)
+            source_rate = 16_000
 
-        cache_key = f"{bundle}::{self.speaker}"  # same bundle+voice -> one cached model
-        if cache_key in _MODEL_CACHE:
-            self._model = _MODEL_CACHE[cache_key]
-            return self._model
-
-        loaded = silero_tts(language=language, speaker=bundle)
-        # jit-style models unpack into (model, symbols, sample_rate, example, apply_tts);
-        # packaged v3/v5 ones only return (model, example). Normalize to the model object.
-        if isinstance(loaded, tuple) and loaded:
-            self._model = loaded[0]
-        else:  # pragma: no cover - unexpected silero version layout
-            raise RuntimeError(f"unexpected silero_tts result type: {type(loaded)!r}")
-
-        device = torch_device()
-        self._model.to(device)  # packaged v3 mutates in place and returns None; prefer CUDA.
-        log.info("tts: loaded %s (voice=%s) on %s", bundle, self._voice or "(default)", device.type)
-        _MODEL_CACHE[cache_key] = self._model
-        return self._model
-
-    def generate(self, text: str) -> bytes:
-        """One synthesis call; empty text or a failed load/synthesis returns b''."""
-        if not text or not self.enabled:
-            return b""
-        model = self._load_model()
-        if model is None:
-            log.warning("tts: no model for speaker=%r lang=%s", self.speaker, self.language_code)
-            return b""
-
-        # Empty voice -> _synthesize picks the first available one (bundle case). Non-empty
-        # voice id (en_117, xenia ...) is passed through verbatim to apply_tts().
-        try:
-            audio, source_rate = _synthesize(model, text, self._voice)
-        except Exception as e:  # noqa: BLE001 - synthesis failure must not kill the worker
-            log.warning("tts: generation failed for %r: %s", text[:60], e)
-            return b""
-
-        try:
-            samples = audio.detach().float().cpu()
-            if samples.dim() == 2:
-                samples = samples[0]
-            # The client expects 16 kHz mono f32 LE; resample from the model's native rate.
-            if source_rate != TARGET_SAMPLE_RATE and samples.numel():
-                samples = Resample(source_rate, TARGET_SAMPLE_RATE)(samples)
-            samples = samples.flatten().contiguous()
-        except Exception as e:  # noqa: BLE001 - resampling failure degrades to raw samples
-            log.warning("tts: resample to %d Hz failed: %s", TARGET_SAMPLE_RATE, e)
-
+        samples = audio.detach().float().cpu()
+        if samples.dim() == 2:
+            samples = samples[0]
+        if source_rate != TARGET_SAMPLE_RATE and samples.numel():
+            samples = Resample(source_rate, TARGET_SAMPLE_RATE)(samples)
+        samples = samples.flatten().contiguous()
         return bytes(samples.numpy().astype("<f4").tobytes())
+    except Exception as e:
+        log.warning("tts: generation failed for %r: %s", text[:60], e)
+        return b""
 
 
 def _drain(queue) -> int:
@@ -159,26 +160,6 @@ def _dialogue_tail_text(dialogue: list[DialogueEntry]) -> str:
         *_, s_say, t_say = dialogue
         return f"you: {s_say.text}\nteacher: {t_say.text}\n"
     return ""
-
-
-def torch_device():
-    """CUDA when available so synthesis runs on the GPU, CPU otherwise."""
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def _synthesize(model, text: str, voice: str) -> tuple[object, int]:
-    """Run one synthesis; returns (audio tensor, source sample rate).
-
-    `voice` is the speaker id for multi-voice packaged models. When it's empty we fall back
-    to the first available voice — this is what happens when --speaker named a bundle
-    like v3_en rather than a specific voice such as en_117."""
-    voices = getattr(model, "speakers", None)
-    if isinstance(voices, (list, tuple)) and voices:
-        speaker = str(voice) if voice else sorted(str(v) for v in voices)[0]
-        return model.apply_tts(text=text, speaker=speaker, sample_rate=24_000), 24_000
-
-    # jit-style single-voice models synthesize with a fixed rate.
-    return model.apply_tts(text=text, sample_rate=16_000), 16_000
 
 
 def _parse_json_object(text: str) -> dict | None:
@@ -220,16 +201,62 @@ def _parse_json_object(text: str) -> dict | None:
     return None
 
 
-class LlmAnswerService:
-    """One call to the ollama API returning a JSON object with "say" / "write" fields."""
+class TtsService:
+    """Holds Silero TTS settings; actual synthesis runs in a worker process via _worker_tts."""
 
-    def __init__(self, api_url: str, model: str) -> None:
-        self.api_url = api_url
-        self.model = model
+    def __init__(self, lang: str, speaker: str) -> None:
+        self.speaker = (speaker or "").strip()
+        self.language_code = silero_language(lang)
+        if self.enabled and self.language_code == "auto":
+            log.warning("tts: unknown --lang %r; Silero language will be derived from the speaker id", lang)
+
+        self._voice = "" if self.speaker in _KNOWN_BUNDLE_IDS else self.speaker
 
     @property
     def enabled(self) -> bool:
-        return bool(self.api_url and self.model)
+        return bool(self.speaker) or self.language_code != "auto"
+
+    def _resolve_language(self) -> str:
+        """Language key for silero_tts; falls back from a bundle id, else 'en'."""
+        if self.language_code != "auto":
+            return self.language_code
+        return SPEAKER_LANG_HINT.get(self.speaker, "en")
+
+    def worker_params(self) -> tuple[str, str, str]:
+        """Return (bundle, voice, language) for _worker_tts; resolved once at call time."""
+        language = self._resolve_language()
+        if self.speaker and self.speaker in _KNOWN_BUNDLE_IDS:
+            bundle = self.speaker
+        else:
+            bundle = DEFAULT_BUNDLE_BY_LANG.get(language, "v3_en")
+        return bundle, self._voice, language
+
+
+class LlmAnswerService:
+    """Call an OpenAI-compatible API once; returns a JSON object with "say" / "write" fields.
+
+    The client is created at init and reused across requests; close it via shutdown()."""
+
+    def __init__(self, api_url: str, model: str) -> None:
+        self.model = model
+        if api_url:
+            # A placeholder key keeps construction from raising when OPENAI_API_KEY is unset
+            # (e.g. the LLM is disabled by an empty --llm-model); real requests use the env key.
+            self._client = AsyncOpenAI(
+                base_url=api_url or None,
+                api_key=os.environ.get("OPENAI_API_KEY") or "sk-placeholder",
+            )
+        else:
+            self._client = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._client is not None and bool(self.model)
+
+    async def shutdown(self) -> None:
+        """Close the OpenAI client; safe to call when the LLM is disabled."""
+        if self._client is not None:
+            await self._client.close()
 
     async def request(self, dialogue: list[DialogueEntry], prompt: str) -> tuple[str, str, int | None, bool]:
         """Return (say, write, expected_duration, to_quit).
@@ -239,28 +266,18 @@ class LlmAnswerService:
         LLM decided the dialogue should end once its final answer has been delivered.
         """
         if not self.enabled:
-            log.debug("llm disabled (api_url=%r model=%r)", self.api_url, self.model)
+            log.debug("llm disabled (model=%r)", self.model)
             return "", "", None, False
 
-        client = AsyncClient(host=self.api_url)
-        try:
-            response = await client.generate(model=self.model, think=False, prompt=prompt)
-        finally:
-            # ollama <=0.6.x exposes async close(); newer releases may use aclose(). A failed
-            # cleanup must not mask the real request result or error.
-            for _name in ("aclose", "close"):
-                closer = getattr(client, _name, None)
-                if closer is None:
-                    continue
-                try:
-                    result = closer()
-                    if inspect.isawaitable(result):
-                        await result
-                except Exception as e:  # noqa: BLE001 - cleanup only
-                    log.debug("llm client %s failed: %r", _name, e)
-                break
-
-        text = str(response.response or "").strip()
+        # extra_body disables the chat-template thinking phase so short dialogue replies skip
+        # reasoning tokens; `reasoning` stays as a budget in case thinking is re-enabled.
+        t0 = time.perf_counter()
+        response = await self._client.responses.create(
+            model=self.model, input=prompt, reasoning={"effort": "low"},
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        request_elapsed = time.perf_counter() - t0
+        text = (response.output_text or "").strip()
         parsed = _parse_json_object(text)
         if parsed is None:
             log.warning("llm answer contains no JSON object: %r", text[:120])
@@ -284,8 +301,8 @@ class LlmAnswerService:
         elapsed_minutes = _duration_minutes(dialogue)
         remaining = max(duration - elapsed_minutes, 0) if duration is not None else None
         log.info(
-            "to say: %r to write: %r expected_duration=%s elapsed=%d min remaining=%s quit=%s",
-            say, write, duration, elapsed_minutes, remaining, to_quit,
+            "to say: %r to write: %r expected_duration=%s elapsed=%d min remaining=%s quit=%s llm_took=%.2fs",
+            say, write, duration, elapsed_minutes, remaining, to_quit, request_elapsed,
         )
         return say, write, duration, to_quit
 
@@ -342,18 +359,13 @@ class RecognitionService:
     """Holds per-student queues of SpeechClip and the lesson texts seen so far.
 
     A student is the named peer that connects through `--connect` (host:port); one
-    sayteacher process serves one such student by default ("student").
-    """
+    sayteacher process serves one such student by default ("student")."""
 
-    pipeline: Callable
     quit_msg: asyncio.Queue
 
     def __init__(self, *names: str, model: str = "", lang: str = "English") -> None:
         self.model_id = model  # empty means recognition is off (no dialogue filling)
         self.lang = lang
-        if model:
-            from transformers import pipeline
-            self.pipeline = pipeline
 
         self.students: dict[str, asyncio.Queue[SpeechClip]] = {}
         for name in names:
@@ -375,10 +387,18 @@ class RecognitionService:
         # into quit_msg once it fires so the next LLM reply carries a "time to leave" hint.
         self._duration_timer_task: asyncio.Task | None = None
         # Once set (hint consumed from quit_msg or the LLM answered quit=true), every further
-        # build_prompt call carries the same quit=true — task 36.
+        # build_prompt call carries the same quit=true.
         self.quit_hint = False
         # One-shot delayed QUIT-marker task; created at most once per student session.
         self._quit_marker_task: asyncio.Task | None = None
+
+        # The ASR/TTS models are created inside worker processes; the main process only
+        # holds settings and dispatches numpy samples / text to the pool.
+        self._executor = ProcessPoolExecutor(max_workers=1)
+
+    def shutdown(self) -> None:
+        """Shut down the worker process pool, cancelling pending tasks."""
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _start_duration_timer(self, expected_minutes: float) -> None:
         """Arm the one-shot end-of-lesson timer; started only on the first duration value."""
@@ -391,103 +411,6 @@ class RecognitionService:
             self.quit_msg.put_nowait(QUIT_WORD)
 
         self._duration_timer_task = asyncio.create_task(_timer())
-
-    def _cache_ready(self) -> bool:
-        """True when every file of `self.model_id` is already present in the local HF cache.
-
-        Uses huggingface_hub's native cache scan (offline, no network). A repo counts as
-        ready only if it is listed and has zero leftover `.incomplete` marker files — that
-        means the download finished, so we can load fully from disk.
-        """
-        if not self.model_id:
-            return False
-
-        try:
-            from huggingface_hub import scan_cache_dir
-        except ImportError:  # pragma: no cover - dep is required, but be graceful
-            log.warning("asr: huggingface_hub missing; cannot verify local cache")
-            return False
-
-        try:
-            info = scan_cache_dir()
-        except Exception as e:  # noqa: BLE001 - a broken cache must not block startup
-            log.debug("hf cache scan failed: %s", e)
-            return False
-
-        for repo in info.repos:
-            if repo.repo_id != self.model_id:
-                continue
-            incomplete = [f for f in info.incomplete_files if str(f.file_path).startswith(repo.repo_path)]
-            ready = repo.nb_files > 0 and not incomplete
-            log.info(
-                "hf cache %s: files=%d incomplete=%d -> %s",
-                repo.repo_id, repo.nb_files, len(incomplete), "ready" if ready else "incomplete",
-            )
-            return ready
-
-        log.warning("hf model %r not in local cache; first run will download it (needs network)", self.model_id)
-        return False
-
-    def _build_asr_pipeline(self):
-        """Create the Whisper transcription pipeline for `self.model_id`.
-
-        Kept as a separate method so tests can monkeypatch it and avoid loading a real
-        model / touching CUDA. When the whole repo is already cached locally we load offline
-        (no HEAD/GET requests to huggingface.co), which also enables an offline mode; otherwise
-        we let transformers fetch what's missing on the first run.
-        """
-        pipeline = getattr(self, "pipeline", None)
-        if pipeline is None:  # not set at init time or mocked out without the import
-            from transformers import pipeline as pipeline
-
-        # The explicit task is mandatory in offline mode (transformers 5.x cannot infer it
-        # from a bare model id), and `local_files_only` leaks into model_kwargs there, so we
-        # gate offlineness through HF_HUB_OFFLINE instead — same effect, no stray kwarg.
-        if self._cache_ready():
-            os.environ["HF_HUB_OFFLINE"] = "1"
-            log.info("asr: loading %s from local cache (offline)", self.model_id)
-
-        return pipeline(
-            task="automatic-speech-recognition",
-            model=self.model_id,
-            device_map="auto",
-            dtype="auto",
-        )
-
-    @staticmethod
-    def _transcribe(pipeline, samples, lang: str | None = "en"):
-        """Transcribe one float32 sample buffer through the ASR pipeline.
-
-        `lang` is a Whisper language code ('en', 'ru', ...) or None to let Whisper guess.
-        no_speech_threshold and logprob_threshold suppress low-confidence / non-speech clips;
-        condition_on_prev_tokens=False keeps each clip independent (no cross-contamination).
-
-        temperature is a tuple of fallback temperatures (per the podlodka-turbo doc) — without
-        it transformers 5.x raises "'>' not supported between NoneType and float" inside
-        _retrieve_avg_logprobs whenever logprob_threshold is set.
-        """
-        kwargs: dict = {
-            "task": "transcribe",
-            "no_speech_threshold": 0.6,
-            "logprob_threshold": -1.0,
-            "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-            "condition_on_prev_tokens": False,
-        }
-        if lang is not None:
-            kwargs["language"] = lang
-
-        result = pipeline(
-            samples,
-            generate_kwargs=kwargs,
-            return_timestamps=False,
-        )
-        text = ""
-        if isinstance(result, dict) and "text" in result:
-            text = str(result["text"]).strip()
-        elif isinstance(result, list) and result:
-            first = result[0]
-            text = str(first.get("text", "")).strip() if isinstance(first, dict) else str(first).strip()
-        return text
 
     async def reset_session(self, name: str) -> None:
         """Clear all per-session state for a student after the session ended or was dropped.
@@ -542,17 +465,6 @@ class RecognitionService:
                 await queue.get()
                 continue
 
-        pipeline = None
-        try:
-            pipeline = self._build_asr_pipeline()
-        except Exception as e:
-            log.error("failed to load ASR model %s for %s: %s", self.model_id, name, e)
-
-        if pipeline is None:
-            while True:
-                await queue.get()
-                continue
-
         async def llm_reply(dialogue: list[DialogueEntry]) -> tuple[str | None, str, bool]:
             """Ask the LLM; store "say" as a teacher entry. Return ("write", "say", to_quit)."""
             if not (llm_api and getattr(llm_api, "enabled", False)):
@@ -588,6 +500,7 @@ class RecognitionService:
             self.quit_hint = self.quit_hint or to_quit
             return write or None, say, to_quit
 
+        loop = asyncio.get_running_loop()
         while True:
             clip = await queue.get()
             try:
@@ -597,27 +510,34 @@ class RecognitionService:
                 if lang_code == "auto":
                     lang_code = ""
 
-                def _transcribe_clip() -> str:
-                    return self._transcribe(pipeline, clip.to_numpy(), lang=lang_code or None)
-
-                text = await asyncio.to_thread(_transcribe_clip)
+                t0 = time.perf_counter()
+                text = await loop.run_in_executor(
+                    self._executor, _worker_transcribe, self.model_id, lang_code or None, clip.to_numpy(),
+                )
+                recognition_elapsed = time.perf_counter() - t0
                 if not text:
                     log.debug("empty recognition for %s (uid=%s)", name, clip.uid.hex())
                     continue
 
                 dialogue = self.dialogues.setdefault(name, [])
                 dialogue.append(DialogueEntry(time=datetime.now(), is_student=True, text=text))
-                log.info("recognized %s uid=%s: %r", name, clip.uid.hex(), text[:80])
+                log.info(
+                    "recognized %s uid=%s took=%.2fs: %r",
+                    name, clip.uid.hex(), recognition_elapsed, text[:80],
+                )
 
                 write, say, to_quit = await llm_reply(dialogue)
                 if not (write or say):
                     continue
 
-                # TTS of the "say" text; runs off-loop so synthesis does not block the event loop.
+                # TTS of the "say" text; runs in a worker process so synthesis does not block.
                 tts_audio = b""
                 if say and tts is not None:
                     try:
-                        tts_audio = await asyncio.to_thread(tts.generate, say)
+                        bundle, voice, language = tts.worker_params()
+                        tts_audio = await loop.run_in_executor(
+                            self._executor, _worker_tts, bundle, voice, language, say,
+                        )
                     except Exception as e:  # noqa: BLE001 - one bad reply must not kill the worker
                         log.warning("tts generation failed for %s: %s", name, e)
 

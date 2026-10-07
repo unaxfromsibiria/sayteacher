@@ -14,6 +14,12 @@ pub enum MessageKind {
     Note,
     /// End-of-session marker from the teacher side; delivered after its final answer frame.
     Quit,
+    /// Output-device capture stream from outvoiceagent (system audio playback).
+    Output,
+    /// Translation result for transcreenpt service.
+    Translate,
+    /// Keep-alive frame sent during silence so neither side times the connection out; echoed back by the peer.
+    Ping,
 }
 
 impl MessageKind {
@@ -23,6 +29,9 @@ impl MessageKind {
             'd' => Some(Self::Dialogue),
             'n' => Some(Self::Note),
             'q' => Some(Self::Quit),
+            'o' => Some(Self::Output),
+            't' => Some(Self::Translate),
+            'p' => Some(Self::Ping),
             _ => None,
         }
     }
@@ -33,6 +42,9 @@ impl MessageKind {
             Self::Dialogue => b'd',
             Self::Note => b'n',
             Self::Quit => b'q',
+            Self::Output => b'o',
+            Self::Translate => b't',
+            Self::Ping => b'p',
         }
     }
 }
@@ -178,7 +190,7 @@ mod tests {
     #[test]
     fn kind_and_audio_body_strip_the_type_byte() {
         let data: Vec<u8> = (0..12).collect();
-        for kind in [MessageKind::Audio, MessageKind::Dialogue, MessageKind::Note] {
+        for kind in [MessageKind::Audio, MessageKind::Dialogue, MessageKind::Note, MessageKind::Output] {
             let msg = Message {
                 id: Uuid::nil(),
                 text: String::new(),
@@ -197,6 +209,23 @@ mod tests {
         let empty = Message { id: Uuid::nil(), text: String::new(), audio: Bytes::new() };
         assert_eq!(empty.kind(), None);
         assert!(empty.audio_body().is_empty());
+    }
+
+    #[test]
+    fn ping_kind_roundtrips() {
+        // Python mirrors this exact code (p) in its MessageKind enum.
+        assert_eq!(MessageKind::Ping.byte(), b'p');
+        assert_eq!(MessageKind::from_byte(b'p'), Some(MessageKind::Ping));
+
+        let msg = Message {
+            id: Uuid::new_v4(),
+            text: String::new(),
+            audio: Message::audio_with_kind(MessageKind::Ping, &[]),
+        };
+        assert_eq!(msg.kind(), Some(MessageKind::Ping));
+        let decoded = Message::decode(&msg.encode()).unwrap();
+        assert_eq!(decoded.id, msg.id);
+        assert_eq!(decoded.kind(), Some(MessageKind::Ping));
     }
 
     #[test]

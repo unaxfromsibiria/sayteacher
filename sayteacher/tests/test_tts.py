@@ -1,6 +1,5 @@
 import asyncio
-
-from sayteacher.service import TtsService
+from concurrent.futures import Future as _CFFuture
 
 
 def _clip(n_samples: int) -> bytes:
@@ -38,6 +37,37 @@ class FakeTts:
         return b"audio-bytes"
 
 
+class _FakeExecutor:
+    """Stands in for ProcessPoolExecutor; returns canned results for transcribe and tts."""
+
+    def __init__(self, transcribe_replies=None, tts_result=b"", tts_exc=None) -> None:
+        self._transcribe = list(transcribe_replies or ["привет"])
+        self._i = 0
+        self._tts_result = tts_result
+        self._tts_exc = tts_exc
+        self.calls: list[tuple[str, tuple]] = []
+
+    def submit(self, fn, *args):
+        name = getattr(fn, "__name__", str(fn))
+        self.calls.append((name, args))
+        fut = _CFFuture()
+        if name == "_worker_transcribe":
+            text = self._transcribe[self._i] if self._i < len(self._transcribe) else ""
+            self._i += 1
+            fut.set_result(text)
+        elif name == "_worker_tts":
+            if self._tts_exc:
+                fut.set_exception(self._tts_exc)
+            else:
+                fut.set_result(self._tts_result)
+        else:
+            fut.set_result("")
+        return fut
+
+    def shutdown(self, wait=False, cancel_futures=True) -> None:
+        pass
+
+
 def test_silero_language_mapping_from_names_and_codes():
     from sayteacher.common import silero_language
 
@@ -68,6 +98,8 @@ def test_silero_language_unknown_returns_auto():
 
 
 def test_tts_enabled_and_disabled_states():
+    from sayteacher.service import TtsService
+
     # No language and no speaker: nothing to synthesize.
     assert TtsService(lang="", speaker="").enabled is False
     assert TtsService(lang="Klingon", speaker="").enabled is False
@@ -76,8 +108,28 @@ def test_tts_enabled_and_disabled_states():
     assert TtsService(lang="English", speaker="").enabled is True
     assert TtsService(lang="Klingon", speaker="v3_en").enabled is True
 
-    # generate() short-circuits to empty audio when there is no text / not enabled.
-    assert TtsService(lang="", speaker="").generate("hello") == b""
+
+def test_tts_worker_params_resolves_bundle_and_voice():
+    from sayteacher.service import TtsService
+
+    # English with no specific voice -> default bundle, empty voice.
+    tts = TtsService(lang="English", speaker="")
+    assert tts.worker_params() == ("v3_en", "", "en")
+
+    # Russian with a named voice.
+    tts = TtsService(lang="Russian", speaker="ru_12")
+    bundle, voice, language = tts.worker_params()
+    assert language == "ru"
+    assert voice == "ru_12"
+    assert bundle != ""  # some valid Russian bundle
+
+
+def test_tts_worker_params_bundle_id_as_speaker():
+    from sayteacher.service import TtsService
+
+    # When --speaker is a known bundle id, it becomes the bundle and voice stays empty.
+    tts = TtsService(lang="English", speaker="v3_en")
+    assert tts.worker_params() == ("v3_en", "", "en")
 
 
 def test_process_puts_write_and_tts_audio_into_outbox(monkeypatch):
@@ -86,25 +138,19 @@ def test_process_puts_write_and_tts_audio_into_outbox(monkeypatch):
     from sayteacher.service import RecognitionService
 
     api = RecognitionService("s", model="some/model")
+    # Fake executor: transcribe returns "привет", tts returns audio bytes.
+    api._executor = _FakeExecutor(transcribe_replies=["привет"], tts_result=b"audio-bytes")
 
-    class FakePipeline:
-        def __call__(self, samples, generate_kwargs=None, return_timestamps=None):
-            return {"text": "привет"}
+    from test_llm import FakeOpenAIClient
 
-    monkeypatch.setattr(api, "_build_asr_pipeline", lambda: FakePipeline())
-
-    class FakeOllamaClient:
-        async def generate(self, model, think, prompt):
-            import json
-
-            return type("R", (), {"response": json.dumps({"say": "teacher hi", "write": "hi!"})})()
-
-        async def close(self):
-            return None
-
-    monkeypatch.setattr(svc_mod, "AsyncClient", lambda host=None, **kw: FakeOllamaClient())
+    monkeypatch.setattr(
+        svc_mod, "AsyncOpenAI",
+        lambda base_url=None, **kw: FakeOpenAIClient(base_url=base_url, payload={"say": "teacher hi", "write": "hi!"}),
+    )
     llm = LlmAnswerService("http://x", "m")
-    tts = FakeTts()
+
+    from sayteacher.service import TtsService
+    tts = TtsService(lang="English", speaker="v3_en")
 
     async def scenario():
         worker = asyncio.create_task(api.process("s", llm_api=llm, tts=tts))
@@ -126,7 +172,6 @@ def test_process_puts_write_and_tts_audio_into_outbox(monkeypatch):
     assert (result[0], result[1], result[2]) == (ord("n"), "hi!", b"")
     assert result[4]  # dialogue tail is filled too
     assert result[5] == b"audio-bytes"
-    assert tts.calls == ["teacher hi"]
 
 
 def test_process_tts_failure_still_sends_write(monkeypatch):
@@ -135,31 +180,25 @@ def test_process_tts_failure_still_sends_write(monkeypatch):
     from sayteacher.service import RecognitionService
 
     api = RecognitionService("s", model="some/model")
+    # Fake executor: transcribe works, tts raises.
+    api._executor = _FakeExecutor(
+        transcribe_replies=["привет"],
+        tts_exc=RuntimeError("cuda oom during synthesis"),
+    )
 
-    class FakePipeline:
-        def __call__(self, samples, generate_kwargs=None, return_timestamps=None):
-            return {"text": "привет"}
+    from test_llm import FakeOpenAIClient
 
-    monkeypatch.setattr(api, "_build_asr_pipeline", lambda: FakePipeline())
-
-    class FakeOllamaClient:
-        async def generate(self, model, think, prompt):
-            import json
-
-            return type("R", (), {"response": json.dumps({"say": "teacher hi", "write": "hi!"})})()
-
-        async def close(self):
-            return None
-
-    monkeypatch.setattr(svc_mod, "AsyncClient", lambda host=None, **kw: FakeOllamaClient())
+    monkeypatch.setattr(
+        svc_mod, "AsyncOpenAI",
+        lambda base_url=None, **kw: FakeOpenAIClient(base_url=base_url, payload={"say": "teacher hi", "write": "hi!"}),
+    )
     llm = LlmAnswerService("http://x", "m")
 
-    class BrokenTts(FakeTts):
-        def generate(self, text: str) -> bytes:
-            raise RuntimeError("cuda oom during synthesis")
+    from sayteacher.service import TtsService
+    tts = TtsService(lang="English", speaker="v3_en")
 
     async def scenario():
-        worker = asyncio.create_task(api.process("s", llm_api=llm, tts=BrokenTts()))
+        worker = asyncio.create_task(api.process("s", llm_api=llm, tts=tts))
         await api.send("s", b"\x01" * 16, "", _clip(800))
 
         done = await _wait_until(lambda: api.outboxes["s"].qsize() >= 2)
@@ -180,100 +219,38 @@ def test_process_tts_failure_still_sends_write(monkeypatch):
     assert api.dialogues["s"]
 
 
-def test_voice_id_selects_that_speaker(monkeypatch):
-    """--speaker en_117 must load the v3_en bundle and call apply_tts with voice=en_117."""
-    import torch
-
-    calls = {}
-
-    class FakeModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.speakers = ["en_0", "en_5", "en_117"]
-
-        def to(self, _device):
-            return None
-
-        def apply_tts(self, text=None, speaker=None, sample_rate=None, **kw):
-            calls["speaker"] = speaker
-            calls["sample_rate"] = sample_rate
-            return torch.zeros(640)  # tiny tensor so resample path is exercised too
-
-    def fake_silero(language, speaker):
-        assert language == "en"
-        assert speaker == "v3_en", f"expected v3_en bundle but got {speaker!r}"
-        return FakeModel(), "example text"
-
-    import sayteacher.service as svc_mod
-    monkeypatch.setattr(svc_mod, "silero_tts", fake_silero)
+def test_voice_id_selects_that_speaker():
+    """--speaker en_117 must resolve to v3_en bundle with voice=en_117."""
+    from sayteacher.service import TtsService
 
     tts = TtsService(lang="English", speaker="en_117")
     # Voice resolution must keep en_117 (it's not a bundle id).
     assert tts._voice == "en_117"
-    audio = tts.generate("hello world")
-    assert len(audio) > 0, "expected non-empty f32 bytes"
-    assert calls["speaker"] == "en_117", f"apply_tts got speaker={calls['speaker']!r}"
+    bundle, voice, language = tts.worker_params()
+    assert bundle == "v3_en"
+    assert voice == "en_117"
+    assert language == "en"
 
 
-def test_bundle_id_falls_back_to_first_voice(monkeypatch):
-    """--speaker v3_en (bundle) must still work, picking the model's first voice."""
-    import torch
-
-    calls = {}
-
-    class FakeModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.speakers = ["en_0", "en_5"]
-
-        def to(self, _device):
-            return None
-
-        def apply_tts(self, text=None, speaker=None, sample_rate=None, **kw):
-            calls["speaker"] = speaker
-            return torch.zeros(640)
-
-    def fake_silero(language, speaker):
-        assert language == "en"
-        assert speaker == "v3_en", f"expected v3_en but got {speaker!r}"
-        return FakeModel(), "example text"
-
-    import sayteacher.service as svc_mod
-    monkeypatch.setattr(svc_mod, "silero_tts", fake_silero)
+def test_bundle_id_falls_back_to_first_voice():
+    """--speaker v3_en (bundle) must still work; voice stays empty so worker picks first."""
+    from sayteacher.service import TtsService
 
     tts = TtsService(lang="English", speaker="v3_en")
     assert tts._voice == ""
-    tts.generate("hello world")
-    assert calls["speaker"] == "en_0", f"apply_tts got speaker={calls['speaker']!r}"
+    bundle, voice, language = tts.worker_params()
+    assert bundle == "v3_en"
+    assert voice == ""
+    assert language == "en"
 
 
-def test_unknown_speaker_still_loads_language_default(monkeypatch):
+def test_unknown_speaker_still_loads_language_default():
     """An unknown voice (e.g. made-up id) still loads the language's default bundle."""
-    import torch
-
-    calls = {}
-
-    class FakeModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.speakers = ["en_0"]
-
-        def to(self, _device):
-            return None
-
-        def apply_tts(self, text=None, speaker=None, sample_rate=None, **kw):
-            calls["speaker"] = speaker
-            return torch.zeros(64)
-
-    def fake_silero(language, speaker):
-        assert language == "en"
-        assert speaker == "v3_en", f"expected v3_en but got {speaker!r}"
-        return FakeModel(), "example text"
-
-    import sayteacher.service as svc_mod
-    monkeypatch.setattr(svc_mod, "silero_tts", fake_silero)
+    from sayteacher.service import TtsService
 
     tts = TtsService(lang="English", speaker="en_999")  # not a bundle, treated as a voice
     assert tts._voice == "en_999"
-    tts.generate("hello")
-    assert calls["speaker"] == "en_999", f"apply_tts got speaker={calls['speaker']!r}"
+    bundle, voice, language = tts.worker_params()
+    assert bundle == "v3_en"
+    assert voice == "en_999"
+    assert language == "en"

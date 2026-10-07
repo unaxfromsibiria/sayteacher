@@ -160,6 +160,16 @@ impl eframe::App for MicroagentApp {
         let button_label = if muted { "Record" } else { "Mute" };
 
         egui::CentralPanel::default().show(ui, |ui| {
+            // Close button in the top-right corner.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                let close = egui::Button::new(
+                    egui::RichText::new("✕").size(18.0).color(egui::Color32::from_rgb(90, 15, 15)),
+                ).fill(egui::Color32::from_rgb(255, 140, 140));
+                if ui.add(close).clicked() {
+                    ui.ctx().send_viewport_cmd(egui::viewport::ViewportCommand::Close);
+                }
+            });
+
             // Connection status: the toggle is only useful while a client session is active.
             if connected {
                 ui.colored_label(egui::Color32::from_rgb(80, 160, 80), "Teacher connection: active");
@@ -168,7 +178,14 @@ impl eframe::App for MicroagentApp {
             }
 
             // Toggle is disabled without a live session so recording cannot be toggled while idle.
-            let button = egui::Button::new(button_label).min_size([120.0, 40.0].into());
+            let fill = if muted {
+                egui::Color32::from_rgb(80, 160, 80)
+            } else {
+                egui::Color32::from_rgb(170, 90, 90)
+            };
+            let button = egui::Button::new(
+                egui::RichText::new(button_label).color(egui::Color32::WHITE),
+            ).fill(fill).min_size([120.0, 40.0].into());
             if ui.add_enabled(connected, button).clicked() {
                 self.ui.set_muted(!muted);
             }

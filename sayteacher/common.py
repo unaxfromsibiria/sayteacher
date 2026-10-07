@@ -90,6 +90,7 @@ class MessageKindEnum(IntEnum):
     AUDIO = 0x61       # 'a' — raw audio only; any text alongside it is informational (e.g. TTS of "say")
     DIALOGUE = 0x64    # 'd' — recent you:/teacher: lines in `text`, optional audio
     NOTE = 0x6E        # 'n' — a note / plain text message
+    OUTPUT = 0x6F      # 'o' — output-device capture stream from outvoiceagent (system audio)
     QUIT = 0x71        # 'q' — end-of-session marker; the client closes after delivery
 
     @classmethod

@@ -1,6 +1,8 @@
 /*/target/*
 AGENTS.md
 TASKS.md
+TASKS.*.md
+pm/*
 examples/*
 /target/*
 /venv/
@@ -16,3 +18,4 @@ eggs/
 */*/__pycache__/
 latest_silero_models.yml
 data-sayteacher
+kilo*

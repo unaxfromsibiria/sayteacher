@@ -1,6 +1,6 @@
 # SayTeacher
 
-English conversation training on your own GPU. Speech recognition using fine-tuned version of Whisper [Whisper-Podlodka-Turbo](https://huggingface.co/bond005/whisper-podlodka-turbo), voice generation, and lesson creation on topics you choose.
+English conversation training on your own GPU. Speech recognition with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (the `distil-medium.en` model from `distil-whisper/distil-medium.en`), voice generation, and lesson creation on topics you choose.
 
 ![Say Teacher](files/cover.jpg)
 
@@ -12,11 +12,11 @@ English conversation training on your own GPU. Speech recognition using fine-tun
 
   ![Say Teacher UI](files/2.jpg)
 
-- Another app that runs locally (or on a system with a suitable GPU or MLX). It uses two models for speech and voice processing and targets the ollama API.
+- Another app that runs locally (or on a system with a suitable GPU or MLX). It uses two models for speech and voice processing and talks to an OpenAI-compatible LLM API.
 
-- ollama - somewhere nearby in your network, or in a Docker container on the same machine.
+- An LLM server - llama.cpp, ollama, or any OpenAI-compatible endpoint - somewhere nearby in your network, or in a Docker container on the same machine.
 
-If you pick a small but good LLM such as `ornith-1.5:9b`, a 12 GB GPU will be enough for everything - and it works great.
+Serve one of the quantized GGUF models with llama.cpp (see below) and even the larger ones fit in a 12 GB GPU - and it works great.
 
 ## Running
 
@@ -26,14 +26,26 @@ First app (UI):
 
 ```bash
 cd microagent
-RUST_LOG=info cargo run --lesson ../files/l2.md
+RUST_LOG=info cargo run -- --lesson ../files/l2.md
 ```
 
-Second app:
+Second app (pointing at a llama.cpp server):
 
 ```bash
-HF_HUB_OFFLINE=1 python -m sayteacher.main --llm-api 'http://localhost:11434/' --llm-model 'ornith15m'
+HF_HUB_OFFLINE=1 python -m sayteacher.main --llm-api 'http://localhost:8080/v1' --llm-model '/models/Huihui-gemma-4-12B-it-abliterated.Q4_K_M.gguf'
 ```
+
+### Running the LLM with llama.cpp
+
+You can serve any of the quantized GGUF models with [llama.cpp](https://github.com/ggml-org/llama.cpp). These parameters keep even the larger models within 12 GB VRAM:
+
+```text
+    -m /models/Huihui-gemma-4-12B-it-abliterated.Q4_K_M.gguf
+    -c 65536 -ngl 99 -fa on -n '-1' -b 1024 -ub 1024
+    --temp 0.2 --min-p 0.05 --top-p 1.0 --top-k 0 --presence-penalty 0.0 --repeat-penalty 1.1
+```
+
+Then point `--llm-api` at the server (`http://localhost:8080/v1`) and `--llm-model` at the model file.
 
 ## Starting with Docker
 
@@ -42,15 +54,15 @@ Startup works as usual - fill in the environment variables in `docker-compose.ya
 ```bash
 docker compose up -d --build
 # run the model download manually
-docker compose exec sayteacher-api bash -c 'HF_HUB_OFFLINE=0 hf download bond005/whisper-podlodka-turbo'
+docker compose exec sayteacher-api bash -c 'HF_HUB_OFFLINE=0 hf download distil-whisper/distil-medium.en'
 ```
 
 For example, everything I had to specify:
 
 ```text
       - CONNECT=10.1.1.2:16050
-      - LLM_MODEL=ornith15m
-      - LLM_API=10.1.1.3
+      - LLM_MODEL=/models/Huihui-gemma-4-12B-it-abliterated.Q4_K_M.gguf
+      - LLM_API=http://10.1.1.3:8080/v1
 ```
 
 ## How to create lessons?
@@ -62,6 +74,8 @@ The lesson files are in the `files` directory - come up with topics you find int
 Local LLM models (~30b) were used during development in a moderate and careful manner - for boilerplate parts like the `help` message, doing it by hand is no longer appealing. Even so, I still strive to keep the code easy to read and comfortable for humans.
 
 ## Plans - what else I'd like to do
+
+- Done. Switched to a faster speech recognition model and a more popular LLM API format.
 
 - I'll make a web version if I get the chance.
 

@@ -218,14 +218,13 @@ async def dialogue_data_processing(
     "--password", default="", show_default=True, help="shared secret used for auth; empty matches a server with no password set."
 )
 @click.option(
-    "--debug", is_flag=True, default=False, show_default=True,
-    help="log at DEBUG level.",
+    "--debug", is_flag=True, default=False, show_default=True, help="log at DEBUG level.",
 )
 @click.option(
     "--check", is_flag=True, help="one short round-trip and exit instead of looping forever (smoke test / CI)."
 )
 @click.option(
-    "--model", "model_id", default="bond005/whisper-podlodka-turbo", show_default=True,
+    "--model", "model_id", default="distil-medium.en", show_default=True,
     help="Whisper model id for recognition; empty disables it (clips are drained, dialogue is not filled).",
 )
 @click.option(
@@ -234,11 +233,11 @@ async def dialogue_data_processing(
 )
 @click.option(
     "--llm-model", "llm_model", default="", show_default=True,
-    help="Ollama model name for teacher answers; empty disables the LLM (dialogue not filled with teacher entries).",
+    help="Model name for teacher answers, empty disables the LLM.",
 )
 @click.option(
     "--llm-api", "llm_api", default="", show_default=True,
-    help="Ollama API base url (e.g. http://127.0.0.1:11434); empty disables the LLM.",
+    help="OpenAI-compatible API base URL, empty disables the LLM.",
 )
 @click.option(
     "--speaker", default="en_101", show_default=True,
@@ -293,7 +292,7 @@ def main(
                     break
 
                 # Connection dropped without a clean quit: clear stale dialogue/queues so the
-                # next session starts fresh (task 41).
+                # next session starts fresh.
                 await api.reset_session(student_name)
                 await asyncio.sleep(0.1)
         finally:
@@ -306,6 +305,8 @@ def main(
                     await process_task
                 except BaseException:  # noqa: BLE001
                     pass
+            api.shutdown()
+            await llm_service.shutdown()
     try:
         sys.exit(asyncio.run(run()))
     except KeyboardInterrupt:

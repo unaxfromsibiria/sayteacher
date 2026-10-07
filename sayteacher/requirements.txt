@@ -5,6 +5,7 @@ transformers
 torch==2.14.0
 whisper-lid
 accelerate
-ollama==0.6.2
+openai>=1.50.0
 silero==0.5.5
 iso3166
+faster-whisper==1.2.1

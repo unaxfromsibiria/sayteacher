@@ -14,3 +14,4 @@ sayteacher/tests/
 sayteacher/__pycache__/
 Dockerfile
 .dockerignore
+pm/*
