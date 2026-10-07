@@ -62,6 +62,14 @@ Together they turn any English audio into live bilingual subtitles on your scree
 
 ### Running
 
+Download the speech model once (if not already present):
+
+```bash
+hf download distil-whisper/distil-medium.en
+```
+
+Then launch both components:
+
 ```bash
 # Terminal 1 - subtitle overlay (captures system audio, displays translated text)
 cd outvoiceagent
