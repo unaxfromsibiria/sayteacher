@@ -1,6 +1,6 @@
 [package]
 name = "outvoiceagent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -8,6 +8,8 @@ edition = "2024"
 cpal = { version = "~0.18", default-features = false, features = ["pipewire", "pulseaudio"] }
 eframe = "~0.36"
 egui = "~0.36"
+# aptitude install libdbus-1-dev libxcb1-dev libegl1-mesa-dev libgbm-dev libxkbcommon-dev
+xcap = "~0.9.8"
 hound = "~3.5"
 log = { version = "~0.4", features = ["std", "serde"] }
 env_logger = "~0.11"

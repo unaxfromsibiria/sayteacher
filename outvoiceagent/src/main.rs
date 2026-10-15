@@ -44,10 +44,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }).expect("failed to spawn server thread");
 
-        let vp = egui::ViewportBuilder::default().with_title("outvoiceagent")
-            .with_transparent(true).with_decorations(false).with_always_on_top()
-            // Initial guess; the app repositions once monitor_size becomes available.
-            .with_inner_size([1536.0, 216.0]).with_position([96.0, 720.0]);
+        let mut vp = egui::ViewportBuilder::default().with_title("outvoiceagent")
+            .with_transparent(true).with_decorations(false).with_always_on_top();
+        if let Some((pos, size)) = ui::resolve_window_geometry() {
+            vp = vp.with_position([pos.x, pos.y]).with_inner_size([size.x, size.y]);
+        } else {
+            vp = vp.with_inner_size([1536.0, 216.0]).with_position([96.0, 720.0]);
+        }
         let options = eframe::NativeOptions {
             viewport: vp,
             ..Default::default()

@@ -37,6 +37,24 @@ pub fn window_title_from_lesson(lesson_data: &str) -> String {
 
 const MAX_LINES: usize = 500;
 
+/// Resolve window position/size centered on the primary monitor before the first frame.
+pub fn resolve_window_geometry() -> Option<(egui::Pos2, egui::Vec2)> {
+    let monitors = xcap::Monitor::all().ok()?;
+    let monitor = monitors.iter().find(|m| m.is_primary().unwrap_or(false)).or_else(|| monitors.first())?;
+
+    let mon_w = monitor.width().ok()? as f32;
+    let mon_h = monitor.height().ok()? as f32;
+    let mon_x = monitor.x().ok()? as f32;
+    let mon_y = monitor.y().ok()? as f32;
+
+    let w = 1080.0f32.min(mon_w - 40.0);
+    let h = 520.0f32.min(mon_h - 40.0);
+    let x = mon_x + (mon_w - w) / 2.0;
+    let y = mon_y + (mon_h - h) / 2.0;
+
+    Some((egui::Pos2::new(x, y), egui::Vec2::new(w, h)))
+}
+
 /// Separator inserted in the notes field between consecutive messages.
 pub const NOTE_SEPARATOR: &str = "----------";
 

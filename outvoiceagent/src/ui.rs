@@ -13,6 +13,24 @@ const TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(145, 237, 209);
 /// so the top margin only needs a small gap below it (not a full line of room).
 const MARGIN: egui::Margin = egui::Margin { left: 8, right: 8, top: 8, bottom: 8 };
 
+/// Resolve window position/size on the primary monitor before the first frame.
+pub fn resolve_window_geometry() -> Option<(egui::Pos2, egui::Vec2)> {
+    let monitors = xcap::Monitor::all().ok()?;
+    let monitor = monitors.iter().find(|m| m.is_primary().unwrap_or(false)).or_else(|| monitors.first())?;
+
+    let mon_w = monitor.width().ok()? as f32;
+    let mon_h = monitor.height().ok()? as f32;
+    let mon_x = monitor.x().ok()? as f32;
+    let mon_y = monitor.y().ok()? as f32;
+
+    let w = mon_w * 0.8;
+    let h = (mon_h * 0.16).min(mon_h - 56.0);
+    let x = mon_x + mon_w * 0.1;
+    let y = mon_y + mon_h - h - 40.0;
+
+    Some((egui::Pos2::new(x, y), egui::Vec2::new(w, h)))
+}
+
 /// One recognized group: stable id from the transport counter + its latest full text.
 #[derive(Clone, Debug)]
 pub struct GroupText {
@@ -112,8 +130,6 @@ impl UiState {
 /// Transparent, always-on-top overlay pinned to the bottom of the screen.
 pub struct OverlayApp {
     ui: UiState,
-    /// True once size/position were applied from the real monitor size.
-    placed: bool,
     /// Set by the server on SIGINT/SIGTERM; when true the window closes for a clean exit.
     shutdown: Arc<AtomicBool>,
     /// Current subtitle scroll position (px); advanced each frame so text drifts up like credits.
@@ -129,7 +145,7 @@ pub struct OverlayApp {
 
 impl OverlayApp {
     pub fn new(ui: UiState, shutdown: Arc<AtomicBool>) -> Self {
-        Self { ui, placed: false, shutdown, scroll_offset: 0.0, last_update: Instant::now(), max_scroll: 0.0 }
+        Self { ui, shutdown, scroll_offset: 0.0, last_update: Instant::now(), max_scroll: 0.0 }
     }
 }
 
@@ -145,22 +161,6 @@ impl eframe::App for OverlayApp {
         // Share the context so the server thread can repaint the overlay the moment
         // a new recognition arrives instead of waiting for the periodic timer.
         self.ui.set_repaint_ctx(ctx.clone());
-
-        // Apply the real size/position exactly once; afterwards the user's drags win.
-        if !self.placed {
-            if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) {
-                if (monitor.x > 0.0) && (monitor.y > 0.0) {
-                    self.placed = true;
-                    let w = (monitor.x * 0.8).max(320.0);
-                    // Tall enough for the grip panel plus 3 wrapped lines of 30 px text.
-                    let h = (monitor.y * 0.16).min(monitor.y - 56.0).max(40.0);
-                    ctx.send_viewport_cmd(egui::viewport::ViewportCommand::InnerSize(egui::Vec2::new(w, h)));
-                    // OuterPosition is in monitor space; window height == inner height (no decorations).
-                    let pos = egui::Pos2::new(monitor.x * 0.1, monitor.y - h - 40.0);
-                    ctx.send_viewport_cmd(egui::viewport::ViewportCommand::OuterPosition(pos));
-                }
-            }
-        }
 
         // Subtitle-style scrolling: advance the offset by dt each frame so new text appears at the
         // bottom and old text drifts up, like movie credits. Arrow keys override for manual control.

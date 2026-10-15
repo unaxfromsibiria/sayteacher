@@ -1,11 +1,11 @@
 [package]
 name = "microagent"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
 cpal = "~0.18"
-rodio = "~0.22"
+rodio = "~0.23"
 log = { version = "~0.4", features = ["std", "serde"] }
 env_logger = "~0.11"
 tokio = { version = "1", features = ["full"] }
@@ -14,5 +14,6 @@ futures-util = { version = "0.3", features = ["sink"] }
 eframe = "~0.36"
 egui = "~0.36"
 egui_extras = { version = "~0.36", features = ["image"] }
+xcap = "0.4"
 
 microagent-transport = { path = "../microagent-transport" }

@@ -42,9 +42,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }).expect("failed to spawn server thread");
 
         // Wider default so two text columns (notes + dialogue) fit comfortably side by side.
-        let vp = egui::ViewportBuilder::default().with_title(
+        let mut vp = egui::ViewportBuilder::default().with_title(
             window_title.clone()
-        ).with_inner_size([1080.0, 520.0]).with_min_inner_size([720.0, 360.0]);
+        ).with_min_inner_size([720.0, 360.0]);
+        if let Some((pos, size)) = ui::resolve_window_geometry() {
+            vp = vp.with_position([pos.x, pos.y]).with_inner_size([size.x, size.y]);
+        } else {
+            vp = vp.with_inner_size([1080.0, 520.0]);
+        }
         let options = eframe::NativeOptions {
             viewport: vp,
             ..Default::default()
