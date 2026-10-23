@@ -1,6 +1,6 @@
 [package]
 name = "microagent"
-version = "0.1.2"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -8,12 +8,7 @@ cpal = "~0.18"
 rodio = "~0.23"
 log = { version = "~0.4", features = ["std", "serde"] }
 env_logger = "~0.11"
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["codec"] }
-futures-util = { version = "0.3", features = ["sink"] }
-eframe = "~0.36"
-egui = "~0.36"
-egui_extras = { version = "~0.36", features = ["image"] }
-xcap = "0.4"
-
-microagent-transport = { path = "../microagent-transport" }
+eframe = "~0.37"
+egui = "~0.37"
+egui_extras = { version = "~0.37", features = ["image"] }
+xcap = "0.9.8"

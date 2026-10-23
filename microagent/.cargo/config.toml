@@ -1,0 +1,9 @@
+# Added by datatraffic install_rust.sh — link flags for the vendored libdatatraffic.so.
+# Two different relative bases (verified empirically):
+#   -L  native=microagent/vendor/datatraffic  -> rust-lld resolves it against the WORKSPACE ROOT, not this crate dir.
+#   rpath vendor/datatraffic                  -> resolved at runtime against the process CWD (`cd microagent && cargo run`).
+[build]
+rustflags = [
+    "-L", "native=microagent/vendor/datatraffic",
+    "-C", "link-args=-Wl,-rpath,vendor/datatraffic",
+]

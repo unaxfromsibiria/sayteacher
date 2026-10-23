@@ -4,9 +4,8 @@ import signal
 import time
 from unittest import mock
 
-import pytest
-
 import main
+import pytest
 from connection import Connection
 
 

@@ -7,10 +7,12 @@ services:
     restart: always
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - CONNECT=${CONNECT:-127.0.0.1:16050}
-      - PASSWORD=${PASSWORD:-}
+      - REDIS_URL=${REDIS_URL:-redis://localhost:6379}
+      - CRYPTO_KEY=${CRYPTO_KEY:-}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - MODEL=${MODEL:-bond005/whisper-podlodka-turbo}
       - LANGUAGE=${LANGUAGE:-English}
+      - SPEAKER=${SPEAKER:-en_101}
       - LLM_MODEL=${LLM_MODEL:-}
       - LLM_API=${LLM_API:-}
       - LOGLEVEL=${LOGLEVEL:-INFO}

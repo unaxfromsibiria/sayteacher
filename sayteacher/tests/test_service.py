@@ -14,11 +14,11 @@ import pytest
 
 from sayteacher.common import QUIT_WORD
 from sayteacher.common import DialogueEntry
+from sayteacher.service import _TTS_CACHE
+from sayteacher.service import _WHISPER_CACHE
 from sayteacher.service import RecognitionService
 from sayteacher.service import SpeechClip
 from sayteacher.service import TtsService
-from sayteacher.service import _TTS_CACHE
-from sayteacher.service import _WHISPER_CACHE
 from sayteacher.service import _worker_transcribe
 from sayteacher.service import _worker_tts
 

@@ -8,11 +8,13 @@ English conversation training on your own GPU. Speech recognition with [faster-w
 
 - A UI application that listens to and plays audio, showing teacher notes and the content of the dialogue:
 
-  ![Say Teacher UI](files/1.jpg)
+  ![Say Teacher UI](files/1.png)
 
-  ![Say Teacher UI](files/2.jpg)
+  ![Say Teacher UI](files/2.png)
 
 - Another app that runs locally (or on a system with a suitable GPU or MLX). It uses two models for speech and voice processing and talks to an OpenAI-compatible LLM API.
+
+  The UI app and this one exchange data over the [datatraffic](https://github.com/unaxfromsibiria/datatraffic) library - linked as `libdatatraffic` in Rust and imported as the `pydatatraffic` package in Python (Redis pub/sub + AES-256-GCM).
 
 - An LLM server - llama.cpp, ollama, or any OpenAI-compatible endpoint - somewhere nearby in your network, or in a Docker container on the same machine.
 
@@ -108,6 +110,8 @@ The lesson files are in the `files` directory - come up with topics you find int
 Local LLM models (~30b) were used during development in a moderate and careful manner - for boilerplate parts like the `help` message, doing it by hand is no longer appealing. Even so, I still strive to keep the code easy to read and comfortable for humans.
 
 ## Plans - what else I'd like to do
+
+- Remove `microagent-transport`, now deprecated in favor of datatraffic.
 
 - Done. Switched to a faster speech recognition model and a more popular LLM API format.
 

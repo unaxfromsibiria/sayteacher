@@ -1,81 +1,59 @@
-import hashlib
-import uuid as _uuid
-from pathlib import Path
+"""Tests for the datatraffic client factory."""
 
 import pytest
 
-from sayteacher.transport import Transport
-
-LIB_PATH = Path(__file__).resolve().parent.parent / "lib" / "libmicroagent_transport.so"
-
-
-@pytest.fixture()
-def transport():
-    return Transport(str(LIB_PATH))
+from sayteacher.transport import RedisSettings
+from sayteacher.transport import make_client
+from sayteacher.transport import redis_settings
 
 
-def test_roundtrip_empty(transport):
-    msg = transport.decode(transport.encode(bytes(16), "", b""))
-    assert msg.id == bytes(16)
-    assert msg.text == ""
-    assert msg.audio == b""
+def test_redis_settings_reads_env(monkeypatch):
+    monkeypatch.setenv("REDIS_URL", "redis://example:6380")
+    monkeypatch.setenv("CRYPTO_KEY", "ab" * 32)
+    monkeypatch.setenv("REDIS_PASSWORD", "secret")
+
+    s = redis_settings()
+    assert isinstance(s, RedisSettings)
+    assert s.redis_url == "redis://example:6380"
+    assert s.key_hex == "ab" * 32
+    assert s.password == "secret"
 
 
-def test_roundtrip_with_text_and_audio(transport):
-    uid = bytes(range(16))
-    text = "hello world"
-    audio = bytes(range(128))
-    decoded = transport.decode(transport.encode(uid, text, audio))
-    assert decoded.id == uid
-    assert decoded.text == text
-    assert decoded.audio == audio
+def test_redis_settings_defaults(monkeypatch):
+    monkeypatch.setenv("CRYPTO_KEY", "cd" * 32)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD", raising=False)
+
+    s = redis_settings()
+    assert s.redis_url == "redis://localhost:6379"
+    assert s.key_hex == "cd" * 32
+    assert s.password == ""
 
 
-def test_encode_rejects_wrong_length_uuid(transport):
-    with pytest.raises(ValueError, match="exactly 16 bytes"):
-        transport.encode(b"\x00\x01\x02", "x", b"")
+def test_redis_settings_requires_crypto_key(monkeypatch):
+    monkeypatch.delenv("CRYPTO_KEY", raising=False)
+
+    with pytest.raises(KeyError, match="CRYPTO_KEY"):
+        redis_settings()
 
 
-def test_decode_empty_frame_raises(transport):
-    with pytest.raises(ValueError, match="empty frame"):
-        transport.decode(b"")
+def test_make_client_returns_async_client(monkeypatch):
+    """make_client returns an AsyncClient watching all given projects (0.0.4 API)."""
+    from unittest.mock import MagicMock
+    from unittest.mock import patch
 
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+    monkeypatch.setenv("CRYPTO_KEY", "ef" * 32)
+    monkeypatch.delenv("REDIS_PASSWORD", raising=False)
 
-def test_decode_too_short_reports_ffi_error(transport):
-    # 16 bytes is a valid uuid but missing the two u32 length fields -> TooShort.
-    with pytest.raises(ValueError):
-        transport.decode(bytes(16))
-    assert transport.last_error() == 2  # FFI_ERR_TOO_SHORT
-
-
-def test_auth_token_matches_stdlib_sha256(transport):
-    uid = bytes(range(16))
-    password = "secret"
-    expected = hashlib.sha256((str(_uuid.UUID(bytes=uid)) + password).encode()).hexdigest()
-    assert transport.auth_token(uid, password) == expected
-
-
-def test_auth_token_is_deterministic_and_depends_on_inputs(transport):
-    uid = bytes(range(16))
-    other_id = bytes(range(15, 31))
-    token = transport.auth_token(uid, "secret")
-    assert len(token) == 64
-    assert token.islower()
-    assert all(c in "0123456789abcdef" for c in token)
-    # same inputs -> same token; different id or password -> different token.
-    assert transport.auth_token(uid, "secret") == token
-    assert transport.auth_token(other_id, "secret") != token
-    assert transport.auth_token(uid, "other") != token
-
-
-def test_verify_auth_accepts_valid_rejects_invalid(transport):
-    uid = bytes(range(16))
-    good = transport.auth_token(uid, "secret")
-    assert transport.verify_auth(uid, good, "secret") is True
-    # wrong password for the same id must not verify.
-    assert transport.verify_auth(uid, transport.auth_token(uid, "wrong"), "secret") is False
-
-
-def test_verify_auth_empty_password_is_open_handshake(transport):
-    uid = bytes(range(16))
-    assert transport.verify_auth(uid, "", "") is True
+    with patch("pydatatraffic.api.AsyncClient") as mock_cls:
+        client = make_client(("lesson-dialogue", "ready-state"), "test-client")
+        assert isinstance(client, MagicMock)
+        # Verify it was constructed with the right parameters.
+        _, kwargs = mock_cls.call_args
+        assert kwargs["redis_url"] == "redis://localhost:6379"
+        assert kwargs["key_hex"] == "ef" * 32
+        assert kwargs["client_name"] == "test-client"
+        assert kwargs["watch_projects"] == ("lesson-dialogue", "ready-state")
+        # 0.0.4 dropped the send_to parameter: project is passed per send() call.
+        assert "send_to" not in kwargs

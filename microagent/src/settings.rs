@@ -1,5 +1,4 @@
 use std::fmt;
-use std::net::ToSocketAddrs;
 use std::str::FromStr;
 
 /// Required signal level for a sound to be considered non-silent.
@@ -51,21 +50,19 @@ impl SignalLevel {
 pub struct Settings {
     /// Recording duration in seconds per cycle (`--delay`), fractional allowed.
     pub delay: f64,
-    /// TCP host to listen on (`--listen HOST:PORT`, default 127.0.0.1).
-    pub listen_host: String,
-    /// TCP port to listen on (default 16050).
-    pub listen_port: u16,
-    /// True when the program should run as a client (`--connect` was passed).
-    pub client: bool,
-    /// TCP server host to connect to in client mode (`--connect HOST:PORT`).
-    pub connect_host: String,
-    /// TCP server port to connect to (default 16050).
-    pub connect_port: u16,
     /// Required signal level for non-silent detection (`--level low|middle|high`).
     pub level: SignalLevel,
-    /// Shared secret used for the auth handshake; empty disables token matching.
-    pub password: String,
-    /// Content of the text file passed with `--lesson`, sent to each new client.
+    /// True when the program should run as an echo test client (`--client` was passed).
+    pub client: bool,
+    /// Client identity prefix used to name datatraffic clients.
+    pub client_name: String,
+    /// Redis connection URL; empty falls back to env `REDIS_URL`.
+    pub redis_url: String,
+    /// AES-256-GCM key (64 hex chars); empty falls back to env `CRYPTO_KEY`.
+    pub crypto_key: String,
+    /// Redis password; empty means no auth.
+    pub redis_password: String,
+    /// Content of the text file passed with `--lesson`, sent as greeting to sayteacher.
     pub lesson_data: String,
 }
 
@@ -74,53 +71,44 @@ impl Default for Settings {
         Self {
             delay: 3.5,
             level: SignalLevel::Middle,
-            listen_host: "127.0.0.1".to_string(),
-            listen_port: 16050,
             client: false,
-            connect_host: "127.0.0.1".to_string(),
-            connect_port: 16050,
-            password: String::new(),
+            client_name: "microagent".to_string(),
+            redis_url: String::new(),
+            crypto_key: String::new(),
+            redis_password: String::new(),
             lesson_data: String::new(),
         }
     }
 }
 
 impl Settings {
-    /// Full socket address string used for `TcpListener::bind`.
-    pub fn listen_addr(&self) -> String {
-        format!("{}:{}", self.listen_host, self.listen_port)
-    }
-
-    /// Human-readable `HOST:PORT` string the client connects to.
-    pub fn connect_addr_str(&self) -> String {
-        format!("{}:{}", self.connect_host, self.connect_port)
-    }
-
     /// Full CLI help text for `--help` / `-h`.
     pub fn help_text() -> String {
-        "microagent — TCP audio server + UI, or an echo test client.
+        "microagent — datatraffic audio server + UI, or an echo test client.
 
 usage: microagent [options]
-       Run as a server by default; pass --connect to run the client instead.
+       Run as a server by default; pass --client to run the echo test client instead.
 
 Options:
-  -h, --help            Show this help and exit.
-      --delay <SEC>     Recording interval in seconds; fractional allowed [default: 3.5]
-      --level <LVL>     Signal level low|middle|high [default: middle]
-      --listen <ADDR>   Host:port to listen on (server) [default: 127.0.0.1:16050]
-      --connect <ADDR>  Host:port of the server; switches to client mode [default: 127.0.0.1:16050]
-      --password <PWD>  Shared secret for the auth handshake (empty disables it)
-      --lesson <FILE>   Lesson file read at startup and sent to each new client
+  -h, --help              Show this help and exit.
+      --delay <SEC>       Recording interval in seconds; fractional allowed [default: 3.5]
+      --level <LVL>       Signal level low|middle|high [default: middle]
+      --client            Run as an echo test client (no UI)
+      --lesson <FILE>     Lesson file read at startup and sent to sayteacher as greeting
+      --redis-url <URL>   Redis connection URL [env: REDIS_URL]
+      --crypto-key <KEY>  AES-256-GCM key, 64 hex chars [env: CRYPTO_KEY]
+      --redis-password <P> Redis password (empty = no auth)
+      --client-name <N>   Client identity prefix [default: microagent]
 
 Examples:
-  microagent                                   # server on 127.0.0.1:16050, delay 3.5s
-  microagent --listen 0.0.0.0:16050 --level high
-  microagent --connect 192.168.1.20:16050      # echo test client
+  microagent                                   # server, delay 3.5s
+  microagent --level high --lesson lesson.txt  # server with lesson file
+  microagent --client                          # echo test client
 "
         .to_string()
     }
 
-    /// Parse `--delay` and `--listen` from command line args.
+    /// Parse command line args into Settings.
     pub fn from_args() -> Self {
         let mut settings = Self::default();
         let args: Vec<String> = std::env::args().collect();
@@ -159,51 +147,9 @@ Examples:
                     }
                     i += 2;
                 },
-                "--listen" => {
-                    if i + 1 >= args.len() {
-                        log::error!("--listen requires a HOST:PORT value");
-                        std::process::exit(2);
-                    }
-                    let parsed = match args[i + 1].to_socket_addrs().and_then(|mut it| {
-                        it.next().ok_or(std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty socket address"))
-                    }) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            log::error!("invalid --listen value {}: {}", args[i + 1], e);
-                            std::process::exit(2);
-                        },
-                    };
-                    settings.listen_host = format!("{}", parsed.ip());
-                    settings.listen_port = parsed.port();
-                    i += 2;
-                },
-                "--connect" => {
-                    if i + 1 >= args.len() {
-                        log::error!("--connect requires a HOST:PORT value");
-                        std::process::exit(2);
-                    }
-                    let parsed = match args[i + 1].to_socket_addrs().and_then(|mut it| {
-                        it.next().ok_or(std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty socket address"))
-                    }) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            log::error!("invalid --connect value {}: {}", args[i + 1], e);
-                            std::process::exit(2);
-                        },
-                    };
-                    settings.connect_host = format!("{}", parsed.ip());
-                    settings.connect_port = parsed.port();
-                    // Passing --connect switches the program into client (echo) mode.
+                "--client" => {
                     settings.client = true;
-                    i += 2;
-                },
-                "--password" => {
-                    if i + 1 >= args.len() {
-                        log::error!("--password requires a value");
-                        std::process::exit(2);
-                    }
-                    settings.password = args[i + 1].clone();
-                    i += 2;
+                    i += 1;
                 },
                 "--lesson" => {
                     if i + 1 >= args.len() {
@@ -221,6 +167,38 @@ Examples:
                             std::process::exit(1);
                         }
                     }
+                    i += 2;
+                },
+                "--redis-url" => {
+                    if i + 1 >= args.len() {
+                        log::error!("--redis-url requires a value");
+                        std::process::exit(2);
+                    }
+                    settings.redis_url = args[i + 1].clone();
+                    i += 2;
+                },
+                "--crypto-key" => {
+                    if i + 1 >= args.len() {
+                        log::error!("--crypto-key requires a value");
+                        std::process::exit(2);
+                    }
+                    settings.crypto_key = args[i + 1].clone();
+                    i += 2;
+                },
+                "--redis-password" => {
+                    if i + 1 >= args.len() {
+                        log::error!("--redis-password requires a value");
+                        std::process::exit(2);
+                    }
+                    settings.redis_password = args[i + 1].clone();
+                    i += 2;
+                },
+                "--client-name" => {
+                    if i + 1 >= args.len() {
+                        log::error!("--client-name requires a value");
+                        std::process::exit(2);
+                    }
+                    settings.client_name = args[i + 1].clone();
                     i += 2;
                 },
                 other => {
@@ -272,8 +250,21 @@ mod tests {
     #[test]
     fn help_text_lists_all_options() {
         let h = super::Settings::help_text();
-        for flag in ["--delay", "--level", "--listen", "--connect", "--password", "--lesson", "usage"] {
+        for flag in [
+            "--delay", "--level", "--client", "--lesson",
+            "--redis-url", "--crypto-key", "--redis-password", "--client-name", "usage",
+        ] {
             assert!(h.contains(flag), "missing '{}' in help text", flag);
         }
+    }
+
+    #[test]
+    fn defaults_are_sane() {
+        let s = super::Settings::default();
+        assert_eq!(s.delay, 3.5);
+        assert!(!s.client);
+        assert_eq!(s.client_name, "microagent");
+        assert!(s.redis_url.is_empty());
+        assert!(s.crypto_key.is_empty());
     }
 }

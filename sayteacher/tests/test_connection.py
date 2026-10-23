@@ -1,184 +1,165 @@
+"""Tests for the Connection wrapper over one datatraffic AsyncClient (0.0.4 API)."""
+
 import asyncio
-import logging
-import struct
-from pathlib import Path
+from collections import deque
 
 import pytest
 
 from sayteacher.common import MessageKindEnum
+from sayteacher.connection import LESSON_PROJECT
+from sayteacher.connection import READY_PROJECT
 from sayteacher.connection import Connection
-from sayteacher.connection import connect_addr
-from sayteacher.transport import Transport
-
-LIB_PATH = Path(__file__).resolve().parent.parent / "lib" / "libmicroagent_transport.so"
 
 
-class _FakeWriter:
+class FakeClient:
+    """Minimal fake matching AsyncClient 0.0.4's send/recv/close/__aenter__ interface."""
+
     def __init__(self) -> None:
-        self.chunks = bytearray()
+        self.sent = []  # list of (project, name, note, data) tuples
+        self._inbox = deque()  # frames to be received
         self.closed = False
+        self.entered = False
 
-    def write(self, data: bytes) -> None:
-        self.chunks += data
+    async def __aenter__(self):
+        self.entered = True
+        return self
 
-    async def drain(self) -> bool:
-        return True
+    def send(self, project: str, name: str, note: str = "", data: bytes = b"") -> None:
+        self.sent.append((project, name, note, data))
 
-    def close(self) -> None:
+    async def recv(self):
+        """Block until a frame is available; raise if none and closed."""
+        while not self._inbox:
+            if self.closed:
+                raise ConnectionError("client closed")
+            await asyncio.sleep(0.01)
+        return self._inbox.popleft()
+
+    def put_frame(self, project: str, name: str, note: str = "", data: bytes = b"") -> None:
+        """Test helper: enqueue a frame for recv()."""
+        from pydatatraffic.api import ReceivedFile
+        self._inbox.append(ReceivedFile(project=project, name=name, note=note, data=data))
+
+    async def close(self) -> None:
         self.closed = True
 
-    async def wait_closed(self) -> None:
-        pass
 
-    @property
-    def buffer(self) -> bytes:
-        return bytes(self.chunks)
-
-
-class _FakeReader:
-    def __init__(self, data: bytes) -> None:
-        self._buf = bytearray(data)
-
-    async def read(self, n: int) -> bytes:
-        out = self._buf[:n]
-        del self._buf[:n]
-        return bytes(out)
-
-
-def _frame(payload: bytes) -> bytes:
-    return len(payload).to_bytes(4, "big") + payload
-
-
-def test_connect_addr_parses_host_and_port():
-    host, port = connect_addr("127.0.0.1:16050")
-    assert (host, port) == ("127.0.0.1", 16050)
-
-
-def test_connect_addr_rejects_missing_port():
-    try:
-        connect_addr("localhost")
-    except ValueError as exc:
-        assert "host:port" in str(exc)
-    else:  # pragma: no cover - guard against accidental pass-through.
-        raise AssertionError("expected ValueError for addr without a port")
-
-
-def test_write_raw_is_big_endian_length_prefixed():
-    writer = _FakeWriter()
-    Connection._write_raw(writer, b"payload-bytes")
-    assert writer.buffer == len(b"payload-bytes").to_bytes(4, "big") + b"payload-bytes"
-
-
-def test_read_whole_roundtrips_a_written_frame():
-    reader = _FakeReader(_frame(b"hello from frame"))
-    assert asyncio.run(Connection._read_whole(reader)) == b"hello from frame"
-
-
-def test_read_whole_handles_multiple_chunk_reads():
-    # The declared payload length is 10 but each underlying read returns at most 3 bytes,
-    # so the helper must keep reading until it has exactly the full payload.
-    payload = b"x" * 10
-
-    class _ChunkedReader(_FakeReader):
-        async def read(self, n: int) -> bytes:
-            return await super().read(min(n, 3))
-
-    reader = _ChunkedReader(_frame(payload))
-    assert asyncio.run(Connection._read_whole(reader)) == payload
-
-
-def test_read_whole_raises_when_peer_closes_mid_frame():
-    # Declared length is 8 but only 4 bytes are available before EOF.
-    reader = _FakeReader((8).to_bytes(4, "big") + b"only-4")
-    with pytest.raises(ConnectionError, match="peer closed mid-frame"):
-        asyncio.run(Connection._read_whole(reader))
-
-
-def test_send_encodes_and_writes_one_frame():
-    transport = Transport(str(LIB_PATH))
-    conn = Connection("h", 1, "", transport)
-
-    writer = _FakeWriter()
-    conn.writer = writer
-    uid = bytes(range(16))
-    assert asyncio.run(conn.send(uid, "record x length: 4", b"abcd")) is True
-
-    raw = writer.buffer[4:]  # strip the 4-byte frame length prefix
-    msg = transport.decode(raw)
-    assert msg.id == uid
-    assert msg.text == "record x length: 4"
-    assert msg.audio == b"abcd"
-
-
-def test_send_returns_false_when_socket_write_fails(caplog):
-    class _BrokenWriter(_FakeWriter):
-        async def drain(self) -> bool:
-            raise OSError("broken pipe")
-
-    transport = Transport(str(LIB_PATH))
-    conn = Connection("h", 1, "", transport)
-    conn.writer = _BrokenWriter()
-
-    with caplog.at_level(logging.ERROR):
-        assert asyncio.run(conn.send(bytes(16), "x", b"")) is False
+def _make_conn() -> tuple[Connection, FakeClient]:
+    client = FakeClient()
+    conn = Connection(client=client)
+    return conn, client
 
 
 def test_drain_outbox_sends_typed_frames():
-    transport = Transport(str(LIB_PATH))
-    conn = Connection("h", 1, "", transport)
+    """Outbox items are sent on lesson-dialogue with kind byte mapped to frame name."""
 
-    writer = _FakeWriter()
-    conn.writer = writer
-    outbox: asyncio.Queue = asyncio.Queue()
-    outbox.put_nowait((int(MessageKindEnum.NOTE), "hi!", b""))
-    audio_payload = struct.pack("<f", 0.25) * 4
-    outbox.put_nowait((int(MessageKindEnum.DIALOGUE), "you: hi\nteacher: hello\n", audio_payload))
+    async def scenario():
+        conn, client = _make_conn()
+        outbox: asyncio.Queue = asyncio.Queue()
+        outbox.put_nowait((int(MessageKindEnum.NOTE), "hi!", b""))
+        audio_payload = b"\x00\x00\x80?\x00\x00\x00@\x00\x00\x00@\x00\x00\x00@"
+        outbox.put_nowait((int(MessageKindEnum.DIALOGUE), "you: hi\nteacher: hello\n", audio_payload))
 
-    assert asyncio.run(conn.drain_outbox(outbox, "student")) == (True, False)
-    assert outbox.empty()
+        result = await conn.drain_outbox(outbox, "student")
+        assert result == (True, False)
+        assert outbox.empty()
 
-    # Two frames back-to-back; the second must carry the 'd' kind as its first audio byte.
-    data = writer.buffer
-    first_len = int.from_bytes(data[:4], "big")
-    rest = data[4 + first_len:]
+        # Verify frames were sent on the lesson project with correct names.
+        assert client.sent[0] == (LESSON_PROJECT, "n", "hi!", b"")
+        assert client.sent[1][0] == LESSON_PROJECT
+        assert client.sent[1][1] == "d"
+        assert client.sent[1][2] == "you: hi\nteacher: hello\n"
+        assert client.sent[1][3] == audio_payload
 
-    msg2 = transport.decode(rest[4:])
-    assert bytes(msg2.audio)[0] == ord("d")
-    assert bytes(msg2.audio)[1:] == audio_payload
+    asyncio.run(scenario())
 
 
 def test_drain_outbox_reports_quit_marker():
-    """A 'q' frame in the outbox must surface as quit_delivered=True after its drain."""
-    transport = Transport(str(LIB_PATH))
-    conn = Connection("h", 1, "", transport)
+    """A 'q' frame in the outbox must surface as quit_delivered=True."""
 
-    writer = _FakeWriter()
-    conn.writer = writer
-    outbox: asyncio.Queue = asyncio.Queue()
-    # Final answer first (delivered before quit), then the quit marker.
-    outbox.put_nowait((int(MessageKindEnum.DIALOGUE), "you: bye\nteacher: goodbye\n", b""))
-    outbox.put_nowait((int(MessageKindEnum.QUIT), "", b""))
+    async def scenario():
+        conn, client = _make_conn()
+        outbox: asyncio.Queue = asyncio.Queue()
+        outbox.put_nowait((int(MessageKindEnum.DIALOGUE), "you: bye\nteacher: goodbye\n", b""))
+        outbox.put_nowait((int(MessageKindEnum.QUIT), "", b""))
 
-    send_ok, quit_delivered = asyncio.run(conn.drain_outbox(outbox, "student"))
-    assert (send_ok, quit_delivered) == (True, True)
+        send_ok, quit_delivered = await conn.drain_outbox(outbox, "student")
+        assert (send_ok, quit_delivered) == (True, True)
+        # Both frames sent: dialogue then quit.
+        assert client.sent[0][1] == "d"
+        assert client.sent[1][1] == "q"
 
-
-def test_drain_outbox_empty_returns_true_without_writing():
-    transport = Transport(str(LIB_PATH))
-    conn = Connection("h", 1, "", transport)
-
-    writer = _FakeWriter()
-    conn.writer = writer
-    assert asyncio.run(conn.drain_outbox(asyncio.Queue(), "student")) == (True, False)
-    assert writer.buffer == b""
+    asyncio.run(scenario())
 
 
-def test_abort_closes_writer_quietly():
-    async def scenario(writer: _FakeWriter) -> bool:
-        await Connection._abort(writer)
-        return writer.closed
+def test_drain_outbox_empty_returns_true_without_sending():
+    """An empty outbox returns (True, False) and sends nothing."""
 
-    writer = _FakeWriter()
-    assert asyncio.run(scenario(writer)) is True
-    # A None writer must be a no-op, not an exception.
-    assert asyncio.run(Connection._abort(None)) is None
+    async def scenario():
+        conn, client = _make_conn()
+        result = await conn.drain_outbox(asyncio.Queue(), "student")
+        assert result == (True, False)
+        assert client.sent == []
+
+    asyncio.run(scenario())
+
+
+def test_pump_routes_frames_by_project():
+    """Frames are routed to the matching inbox by their project field."""
+
+    async def scenario():
+        conn, client = _make_conn()
+        client.put_frame(LESSON_PROJECT, "a", "", b"\x01\x02")
+        client.put_frame(READY_PROJECT, "greeting", "lesson text", b"")
+        client.put_frame("other-project", "x", "", b"")
+
+        lesson = await asyncio.wait_for(conn.recv_lesson(), timeout=1.0)
+        assert (lesson.project, lesson.name, lesson.data) == (LESSON_PROJECT, "a", b"\x01\x02")
+
+        ready = await asyncio.wait_for(conn.recv_ready(), timeout=1.0)
+        assert (ready.project, ready.name, ready.note) == (READY_PROJECT, "greeting", "lesson text")
+
+        # The unknown-project frame must not leak into either inbox.
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(conn.recv_lesson(), timeout=0.1)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(conn.recv_ready(), timeout=0.1)
+
+    asyncio.run(scenario())
+
+
+def test_close_stops_pump_and_closes_client():
+    """close() must cancel the pump task and close the client."""
+
+    async def scenario():
+        conn, client = _make_conn()
+        # Start the pump via a recv that will time out (no frames available).
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(conn.recv_ready(), timeout=0.1)
+        assert client.entered is True
+        pump_task = conn._pump_task
+        assert not pump_task.done()
+
+        await conn.close()
+        assert client.closed is True
+        assert pump_task.cancelled()
+
+    asyncio.run(scenario())
+
+
+def test_close_is_idempotent():
+    """Calling close() twice must not raise."""
+
+    async def scenario():
+        conn, _ = _make_conn()
+        await conn.close()
+        await conn.close()  # second call must be a no-op
+
+    asyncio.run(scenario())
+
+
+def test_connection_accepts_injected_client():
+    """DI: passing a client explicitly skips make_client()."""
+    client = FakeClient()
+    conn = Connection(client=client)
+    assert conn.client is client

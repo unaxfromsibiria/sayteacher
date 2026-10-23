@@ -7,6 +7,8 @@ use std::time::Duration;
 pub struct UiState {
     muted: Arc<std::sync::atomic::AtomicBool>,
     connected: Arc<std::sync::atomic::AtomicBool>,
+    lesson_ended: Arc<std::sync::atomic::AtomicBool>,
+    restart_requested: Arc<std::sync::atomic::AtomicBool>,
     notes: Arc<Mutex<Vec<String>>>,
     dialogue: Arc<Mutex<Vec<String>>>
 }
@@ -16,6 +18,8 @@ impl Default for UiState {
         Self {
             muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lesson_ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            restart_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             notes: Arc::default(),
             dialogue: Arc::default(),
         }
@@ -119,6 +123,25 @@ impl UiState {
         self.connected.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// The current lesson has ended (sayteacher sent its quit marker). Recording pauses until a
+    /// fresh heartbeat starts the next lesson cycle.
+    pub fn set_lesson_ended(&self, ended: bool) {
+        self.lesson_ended.store(ended, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_lesson_ended(&self) -> bool {
+        self.lesson_ended.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The user asked to restart the finished lesson ("Try again"); the service loop re-sends it once.
+    pub fn set_restart_requested(&self, requested: bool) {
+        self.restart_requested.store(requested, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_restart_requested(&self) -> bool {
+        self.restart_requested.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Append one note frame (kind 'n' or untyped text), separated from the previous message,
     /// keeping the field bounded.
     pub fn append_note(&self, text: &str) {
@@ -175,37 +198,45 @@ impl eframe::App for MicroagentApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let muted = self.ui.is_muted();
         let connected = self.ui.is_connected();
-        let button_label = if muted { "Record" } else { "Mute" };
+        let lesson_ended = self.ui.is_lesson_ended();
 
         egui::CentralPanel::default().show(ui, |ui| {
-            // Close button in the top-right corner.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                let close = egui::Button::new(
-                    egui::RichText::new("✕").size(18.0).color(egui::Color32::from_rgb(90, 15, 15)),
-                ).fill(egui::Color32::from_rgb(255, 140, 140));
-                if ui.add(close).clicked() {
-                    ui.ctx().send_viewport_cmd(egui::viewport::ViewportCommand::Close);
-                }
-            });
 
-            // Connection status: the toggle is only useful while a client session is active.
-            if connected {
-                ui.colored_label(egui::Color32::from_rgb(80, 160, 80), "Teacher connection: active");
+            // Status: a finished lesson stays visible until the user restarts it.
+            if lesson_ended {
+                ui.colored_label(egui::Color32::from_rgb(190, 160, 70), "SayTeacher: lesson ended");
+            } else if connected {
+                ui.colored_label(egui::Color32::from_rgb(80, 160, 80), "SayTeacher: active");
             } else {
-                ui.colored_label(egui::Color32::from_rgb(170, 90, 90), "Teacher connection: inactive — waiting for a client");
+                ui.colored_label(egui::Color32::from_rgb(170, 90, 90), "SayTeacher: inactive — waiting for heartbeat");
             }
 
-            // Toggle is disabled without a live session so recording cannot be toggled while idle.
-            let fill = if muted {
-                egui::Color32::from_rgb(80, 160, 80)
+            if lesson_ended {
+                // Lesson ended: offer to restart it. Active while sayteacher is reachable; the click
+                // starts a fresh lesson (recording resumes, button becomes "Mute") and asks the
+                // service loop to re-send the lesson.
+                let button = egui::Button::new(
+                    egui::RichText::new("Try again").color(egui::Color32::WHITE),
+                ).fill(egui::Color32::from_rgb(80, 160, 80)).min_size([120.0, 40.0].into());
+                if ui.add_enabled(connected, button).clicked() {
+                    self.ui.set_muted(false);
+                    self.ui.set_lesson_ended(false);
+                    self.ui.set_restart_requested(true);
+                }
             } else {
-                egui::Color32::from_rgb(170, 90, 90)
-            };
-            let button = egui::Button::new(
-                egui::RichText::new(button_label).color(egui::Color32::WHITE),
-            ).fill(fill).min_size([120.0, 40.0].into());
-            if ui.add_enabled(connected, button).clicked() {
-                self.ui.set_muted(!muted);
+                // Normal Mute/Record toggle; disabled without a live session.
+                let button_label = if muted { "Record" } else { "Mute" };
+                let fill = if muted {
+                    egui::Color32::from_rgb(80, 160, 80)
+                } else {
+                    egui::Color32::from_rgb(170, 90, 90)
+                };
+                let button = egui::Button::new(
+                    egui::RichText::new(button_label).color(egui::Color32::WHITE),
+                ).fill(fill).min_size([120.0, 40.0].into());
+                if ui.add_enabled(connected, button).clicked() {
+                    self.ui.set_muted(!muted);
+                }
             }
 
             ui.separator();
@@ -259,6 +290,28 @@ mod tests {
         assert!(a.is_connected());
         b.set_connected(false);
         assert!(!a.is_connected());
+    }
+
+    #[test]
+    fn lesson_ended_flag_roundtrips_and_shared_by_clone() {
+        let a = UiState::default();
+        let b = a.clone();
+        assert!(!a.is_lesson_ended());
+        b.set_lesson_ended(true);
+        assert!(a.is_lesson_ended());
+        b.set_lesson_ended(false);
+        assert!(!a.is_lesson_ended());
+    }
+
+    #[test]
+    fn restart_requested_flag_roundtrips_and_shared_by_clone() {
+        let a = UiState::default();
+        let b = a.clone();
+        assert!(!a.is_restart_requested());
+        b.set_restart_requested(true);
+        assert!(a.is_restart_requested());
+        b.set_restart_requested(false);
+        assert!(!a.is_restart_requested());
     }
 
     #[test]

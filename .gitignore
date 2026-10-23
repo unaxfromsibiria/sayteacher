@@ -19,3 +19,5 @@ eggs/
 latest_silero_models.yml
 data-sayteacher
 kilo*
+**/vendor/**
+/dist/

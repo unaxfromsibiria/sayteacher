@@ -1,18 +1,15 @@
-use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
-use std::net::SocketAddr;
+use std::num::NonZero;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rodio::{buffer::SamplesBuffer, mixer::Mixer, stream::DeviceSinkBuilder};
-use std::num::NonZero;
+
+use crate::datatraffic::{Client, Config};
 
 use super::settings::Settings;
-use microagent_transport::{Bytes, Message, MessageKind, Uuid};
+use super::ui::UiState;
 
 // Silence-detection tuning (peak amplitude, not RMS — avoids the sqrt).
 const TAIL_SILENCE_MS: u64 = 1100; // trailing quiet required to end a recording
@@ -25,6 +22,18 @@ const MIN_SIGNAL_FILL_RATIO: f32 = 0.10;
 
 /// Speech recognition only needs ~16 kHz mono (whisper), so downsample before sending.
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
+
+// Poll timeout for each datatraffic client per service cycle.
+const RECV_POLL_MS: u32 = 200;
+
+// Retry cadence for re-sending the greeting/lesson until sayteacher confirms receipt.
+const GREETING_INTERVAL_SECS: u64 = 10;
+
+// If no heartbeat received within this window, mark sayteacher as disconnected.
+const HB_STALENESS_SECS: u64 = 25;
+
+// Muted cycle: short sleep instead of recording.
+const MUTE_INTERVAL_MS: u64 = 500;
 
 /// Linear-interpolation resample from `from_rate` to `to_rate`.
 fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
@@ -47,6 +56,7 @@ fn resample_one(i: usize, samples: &[f32], ratio: f64) -> f32 {
     let frac = (pos - idx as f64) as f32;
     samples[idx] * (1.0 - frac) + samples[idx + 1] * frac
 }
+
 /// Downmix interleaved multichannel samples to mono by averaging the channels.
 fn downmix_mono(samples: &[f32], channels: u16) -> Vec<f32> {
     let ch = channels.max(1) as usize;
@@ -105,23 +115,29 @@ fn f32_vec_from_le_bytes(bytes: &[u8]) -> Vec<f32> {
 /// Final output of one record interval.
 struct IntervalResult {
     samples: Vec<f32>,
-    pending_playback: Vec<PendingAudio>,
     /// True when the captured fragment is not worth sending (silent or mostly silence).
     silent: bool,
 }
 
-/// Runs on a dedicated OS thread so cpal::Stream (non-Send) stays there.
-/// Records for at least `delay_secs`, then extends the capture while audio is still present
-/// and stops once the tail goes quiet. Stops early if the client sends data back.
-/// Mute mode: the record loop skips mic capture and uses a short service interval instead.
-const MUTE_INTERVAL_SECS: f64 = 0.5;
+/// Convert incoming mono 16 kHz speech into interleaved device-rate multichannel samples.
+fn upsample_to_device(samples: &[f32], to_rate: u32, channels: u16) -> Vec<f32> {
+    let mono = resample(samples, TARGET_SAMPLE_RATE, to_rate);
+    let ch = channels.max(1) as usize;
+    (mono.iter()).flat_map(|s| std::iter::repeat(*s).take(ch)).collect()
+}
 
-fn record_on_thread(
+/// Decide whether a captured interval should be emitted to sayteacher.
+fn should_emit(result: &IntervalResult, muted_at_send: bool) -> bool {
+    !result.samples.is_empty() && !result.silent && !muted_at_send
+}
+
+/// Inline blocking recording: captures mic for at least `delay_secs`, extends while audio is
+/// still present, and stops once the tail goes quiet or a safety cap is hit. Mute ends early.
+fn record_interval(
     input_device: &cpal::Device,
     delay_secs: f64,
     threshold: f32,
-    inbound: std::sync::mpsc::Receiver<Vec<u8>>,
-    ui: super::ui::UiState,
+    ui: &UiState,
 ) -> Result<IntervalResult, String> {
     let config = input_device.default_input_config().map_err(
         |e| format!("input config error: {}", e)
@@ -130,12 +146,15 @@ fn record_on_thread(
     let sample_rate = config.sample_rate();
 
     // Track when sound was last heard so the tail can be tested for silence.
-    let started = std::time::Instant::now();
-    let last_sound: Arc<Mutex<std::time::Instant>> = Arc::new(Mutex::new(started));
+    let started = Instant::now();
+    let last_sound: Arc<Mutex<Instant>> = Arc::new(Mutex::new(started));
 
-    info!("recording {}s @ {} Hz, {} ch (level threshold {:.4})", delay_secs, sample_rate, channels, threshold);
-    // The audio callback keeps running until the stream is dropped below, so the buffer it
-    // writes into must be shared rather than moved out of the closure.
+    info!(
+        "recording {}s @ {} Hz, {} ch (level threshold {:.4})",
+        delay_secs, sample_rate, channels, threshold
+    );
+
+    // The audio callback keeps running until the stream is dropped below.
     let recorded: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(
         (delay_secs * sample_rate as f64 * channels as f64) as usize,
     )));
@@ -146,7 +165,7 @@ fn record_on_thread(
         config.config(),
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
             if !data.is_empty() && peak_amplitude(data) >= threshold {
-                *last_sound_cb.lock().expect("last_sound poisoned") = std::time::Instant::now();
+                *last_sound_cb.lock().expect("last_sound poisoned") = Instant::now();
             }
             if let Ok(mut g) = buf_cb.lock() {
                 g.extend_from_slice(data);
@@ -157,16 +176,15 @@ fn record_on_thread(
     ).map_err(|e| format!("build_input_stream failed: {}", e))?;
     stream.play().map_err(|e| format!("stream play failed: {}", e))?;
 
-    let mut pending_playback: Vec<PendingAudio> = Vec::new();
     // Recording must not run forever if the audio keeps going.
     let delay_ms = (delay_secs * 1000.0) as u64;
     let max_record_ms = ((delay_secs * MAX_RECORD_FACTOR).max(delay_secs) * 1000.0) as u64;
 
     loop {
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let elapsed_ms = now.duration_since(started).as_millis() as u64;
 
-        // Stop recording as soon as the user presses Mute so we do not keep filling the buffer.
+        // Stop recording as soon as the user presses Mute.
         if ui.is_muted() {
             info!("mute active, ending in-flight recording early (~{}s)", elapsed_ms / 1000);
             break;
@@ -175,7 +193,6 @@ fn record_on_thread(
         // Before the minimum interval we keep recording unconditionally; after it we
         // poll more often so silence can end the capture, capped at max_record_secs.
         if elapsed_ms >= delay_ms {
-            // Minimum interval reached: end on trailing silence or the safety cap.
             let last_sound_at = *last_sound.lock().expect("last_sound poisoned");
             let quiet_ms = now.saturating_duration_since(last_sound_at).as_millis() as u64;
             if quiet_ms >= TAIL_SILENCE_MS {
@@ -191,20 +208,9 @@ fn record_on_thread(
             }
         }
 
-        // Wait for a client frame or re-poll the tail. Use a short timeout while in the
-        // tail phase so silence can be detected even without inbound traffic.
-        let poll_ms = if elapsed_ms >= delay_ms { TAIL_POLL_MS } else { u64::MAX };
-        match inbound.recv_timeout(Duration::from_millis(poll_ms.min(5_000))) {
-            Ok(raw_frame) => {
-                handle_client_frame(&raw_frame, sample_rate, channels, &mut pending_playback, &ui);
-                break; // Client data arrived: stop recording and play it back.
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { /* re-check tail above */ },
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                warn!("recording aborted, client channel closed");
-                break;
-            }
-        }
+        // Sleep briefly so we can re-check the tail and mute state.
+        let sleep_ms = if elapsed_ms >= delay_ms { TAIL_POLL_MS } else { 50 };
+        std::thread::sleep(Duration::from_millis(sleep_ms));
     }
 
     // Dropping the stream stops the audio callback so we own the buffer exclusively.
@@ -214,17 +220,10 @@ fn record_on_thread(
         Err(_) => return Err("record buffer still referenced".to_string()),
     };
 
-    // Drain any client frames still queued in the channel (e.g. a burst of echoes that
-    // arrived while we were deciding to stop on silence). They are all meant for playback.
-    while let Ok(raw) = inbound.try_recv() {
-        handle_client_frame(&raw, sample_rate, channels, &mut pending_playback, &ui);
-    }
-
     let peak = peak_amplitude(&samples);
     let fill = signal_fill_ratio(&samples, channels, sample_rate, threshold);
     // A clip is "silent" when there is no detectable sound at all (peak below threshold) or
-    // when only a small fraction of the interval carried real signal — short keyboard clicks
-    // and other brief transients fall out here and never reach the recognizer.
+    // when only a small fraction of the interval carried real signal.
     let silent = peak < threshold || fill < MIN_SIGNAL_FILL_RATIO;
 
     if samples.is_empty() {
@@ -239,403 +238,266 @@ fn record_on_thread(
         );
     }
 
-    Ok(IntervalResult { samples, pending_playback, silent })
+    Ok(IntervalResult { samples, silent })
 }
 
-/// Decide whether a captured interval should be emitted to the client as a transport frame.
-/// Any in-flight capture must be dropped if Mute is active at send time, so a recording that
-/// started before the button was pressed never slips through.
-fn should_emit(result: &IntervalResult, client_gone: bool, muted_at_send: bool) -> bool {
-    !result.samples.is_empty() && !client_gone && !result.silent && !muted_at_send
-}
-
-/// Parse a client frame: push its text into the matching UI field (note vs dialogue)
-/// based on the first-audio-byte kind, and queue any audio body for playback.
-fn handle_client_frame(
-    bytes: &[u8], sample_rate: u32, channels: u16, out: &mut Vec<PendingAudio>, ui: &super::ui::UiState,
-) {
-    let msg = match Message::decode(bytes) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("invalid client message: {}", e);
-            return;
-        }
-    };
-
-    // Route text by the frame kind: dialogue -> the new field, note/other -> the existing log.
-    let kind = msg.kind();
-    if !msg.text.is_empty() {
-        info!("Text to read (kind={:?}):\n{}", kind, msg.text);
-        match kind {
-            Some(MessageKind::Dialogue) => ui.append_dialogue(&msg.text),
-            _ => ui.append_note(&msg.text),
-        }
-    }
-
-    // The audio body is everything after the optional one-byte type marker.
-    let body = msg.audio_body();
-    if body.is_empty() {
-        return;
-    }
-
-    // Inbound audio arrives at TARGET_SAMPLE_RATE mono (server side downsamples before send),
-    // so resample it back to the output device rate and replicate across channels.
-    let mono = f32_vec_from_le_bytes(body.as_ref());
-    let seconds = if TARGET_SAMPLE_RATE > 0 { mono.len() as f64 / TARGET_SAMPLE_RATE as f64 } else { 0.0 };
-    info!("service sent audio ~{seconds:.2}s ({} bytes, id={})", body.len(), msg.id);
-    out.push(PendingAudio { samples: upsample_to_device(&mono, sample_rate, channels) });
-}
-
-/// Convert incoming mono 16 kHz speech into interleaved device-rate multichannel samples.
-fn upsample_to_device(samples: &[f32], to_rate: u32, channels: u16) -> Vec<f32> {
-    let mono = resample(samples, TARGET_SAMPLE_RATE, to_rate);
-    let ch = channels.max(1) as usize;
-    (mono.iter()).flat_map(|s| std::iter::repeat(*s).take(ch)).collect()
-}
-
-/// One message to the playback worker: a batch of buffers plus an optional completion signal.
-struct PlaybackBatch {
-    buffers: Vec<PendingAudio>,
-    done_tx: Option<std::sync::mpsc::Sender<()>>,
-}
-
-/// Spawn a dedicated OS thread that owns rodio's output device and plays batches in order.
-fn start_playback_worker(channels: u16, sample_rate: u32) -> tokio::sync::mpsc::UnboundedSender<PlaybackBatch> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PlaybackBatch>();
-
-    let builder = std::thread::Builder::new().name("playback".into());
-    let _handle = builder.spawn(move || {
-        // Keep MixerDeviceSink alive for the lifetime of this thread; dropping it stops playback.
-        let device_sink = match DeviceSinkBuilder::open_default_sink() {
-            Ok(v) => v,
-            Err(e) => {
-                error!("failed to open audio output: {}", e);
-                return;
-            }
-        };
-
-        let mixer = device_sink.mixer();
-        playback_loop(&mut rx, mixer, channels, sample_rate);
-    }).expect("playback worker thread failed to start");
-
-    tx
-}
-
-fn playback_loop(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<PlaybackBatch>,
-    mixer: &Mixer,
-    channels: u16,
+/// Poll both datatraffic clients for inbound frames. Routes dialogue frames to the UI and
+/// queues audio for playback; updates connection state from heartbeats and lesson acks.
+fn handle_inbound(
+    dialogue_client: &mut Client,
+    ready_client: &mut Client,
     sample_rate: u32,
-) {
-    while let Some(batch) = rx.blocking_recv() {
-        if !batch.buffers.is_empty() {
-            for p in batch.buffers {
-                play_one(mixer, &p.samples, channels, sample_rate);
-            }
-        }
+    channels: u16,
+    ui: &UiState,
+    last_hb: &mut Option<Instant>,
+    lesson_confirmed: &mut bool,
+) -> Vec<PendingAudio> {
+    let mut pending_playback = Vec::new();
 
-        if let Some(done) = batch.done_tx {
-            let _ = done.send(());
+    // Poll dialogue client for sayteacher responses (audio + text).
+    if let Some(file) = dialogue_client.recv(RECV_POLL_MS) {
+        match file.name.as_str() {
+            "d" => {
+                // Dialogue: text in note, audio in data.
+                if !file.note.is_empty() {
+                    info!("Dialogue from sayteacher:\n{}", file.note);
+                    ui.append_dialogue(&file.note);
+                }
+                if !file.data.is_empty() {
+                    let mono = f32_vec_from_le_bytes(&file.data);
+                    let seconds = mono.len() as f64 / TARGET_SAMPLE_RATE as f64;
+                    info!("received dialogue audio ~{seconds:.2}s ({} bytes)", file.data.len());
+                    pending_playback.push(PendingAudio { samples: upsample_to_device(&mono, sample_rate, channels) });
+                }
+            },
+            "n" => {
+                // Note: text only.
+                if !file.note.is_empty() {
+                    info!("Note from sayteacher:\n{}", file.note);
+                    ui.append_note(&file.note);
+                }
+            },
+            "q" => {
+                // sayteacher finished the lesson (LLM quit marker): stop recording like a mute press
+                // so no stale segment is sent, and mark it in UI. "Try again" resumes with a fresh capture.
+                info!("lesson ended by sayteacher");
+                ui.set_lesson_ended(true);
+                ui.set_muted(true);
+                ui.append_dialogue("— lesson ended —");
+            },
+            other => {
+                debug!("unexpected dialogue frame name: '{}'", other);
+            },
         }
     }
+
+    // Poll ready client for heartbeats and the lesson-set ack.
+    if let Some(file) = ready_client.recv(RECV_POLL_MS) {
+        match file.name.as_str() {
+            "hb" => {
+                // A fresh heartbeat means sayteacher is alive. It no longer clears a finished
+                // lesson: after quit sayteacher keeps heartbeating while waiting for a re-sent
+                // lesson, so "Try again" must stay visible until the user acts on it.
+                *last_hb = Some(Instant::now());
+                ui.set_connected(true);
+                debug!("heartbeat received from sayteacher");
+            },
+            "lesson-set" => {
+                // sayteacher stored the lesson; no need to keep re-sending it.
+                if !*lesson_confirmed {
+                    info!("sayteacher confirmed the lesson is set, stopping greeting re-sends");
+                }
+                *lesson_confirmed = true;
+            },
+            other => {
+                debug!("unexpected ready-state frame name: '{}'", other);
+            },
+        }
+    }
+
+    pending_playback
 }
 
-fn play_one(
-    mixer: &Mixer,
-    samples: &[f32],
-    channels: u16,
-    sample_rate: u32,
-) {
-    let buf = SamplesBuffer::new(
-        NonZero::new(channels).expect("channels > 0"),
-        NonZero::new(sample_rate).expect("sample_rate > 0"),
-        samples.to_vec(),
-    );
-
-    // Player is the new per-source API in rodio >= 0.21; it owns a slot
-    // on the mixer and exposes sleep_until_end for blocking playback.
-    let player = rodio::Player::connect_new(mixer);
-    player.append(buf);
-    player.sleep_until_end();
-}
-
-/// Play queued client audio and wait for the worker to finish.
-fn play_pending(worker_tx: &tokio::sync::mpsc::UnboundedSender<PlaybackBatch>, list: Vec<PendingAudio>) {
+/// Play queued audio inline using the rodio mixer. Blocks until all buffers finish.
+fn play_pending(mixer: &Mixer, list: &mut Vec<PendingAudio>, channels: u16, sample_rate: u32) {
     if list.is_empty() {
         return;
     }
     let total: usize = list.iter().map(|p| p.samples.len()).sum();
-    info!("playing back queued client audio ({} samples)", total);
+    info!("playing back queued audio ({} samples)", total);
 
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    if worker_tx.send(PlaybackBatch { buffers: list, done_tx: Some(done_tx) }).is_err() {
-        warn!("playback worker gone; queued audio dropped");
-        return;
+    for p in list.drain(..) {
+        let buf = SamplesBuffer::new(
+            NonZero::new(channels).expect("channels > 0"),
+            NonZero::new(sample_rate).expect("sample_rate > 0"),
+            p.samples,
+        );
+        let player = rodio::Player::connect_new(mixer);
+        player.append(buf);
+        player.sleep_until_end();
     }
-    // Safe on a multi-threaded runtime.
-    tokio::task::block_in_place(move || { let _ = done_rx.recv(); });
+
     info!("playback finished");
 }
 
-/// One-shot auth handshake: wait up to 0.25s for a valid greeting, then verify it.
-async fn authenticate(
-    framed: &mut Framed<TcpStream, LengthDelimitedCodec>,
-    expected_id: Uuid,
-    peer: SocketAddr,
-    password: &str,
-) -> bool {
-    let timeout = Duration::from_millis(250);
-    match tokio::time::timeout(timeout, framed.next()).await {
-        Ok(Some(Ok(raw))) => {
-            let ok = match Message::decode(&raw) {
-                Err(e) => {
-                warn!("auth frame undecodable from {}: {}", peer, e);
-                false
-            }
-                // Client may use any id in the frame; we only care that its text matches.
-                Ok(m) => m.verify_auth(&expected_id, password),
-            };
-            if ok {
-                info!("client {} authenticated", peer);
-            } else {
-                warn!("bad auth token from {}", peer);
-            }
-            ok
-        }
-        Ok(Some(Err(e))) => {
-            warn!("auth read error from {}: {}", peer, e);
-            false
-        }
-        Ok(None) => {
-            warn!("client {} closed before greeting", peer);
-            false
-        }
-        Err(_) => {
-            warn!("no auth greeting from {} within {:?}", peer, timeout);
-            false
-        }
+/// Build a datatraffic Config for the given project and client name suffix.
+fn make_config(settings: &Settings, project: &str, suffix: &str) -> Config {
+    Config {
+        redis_url: settings.redis_url.clone(),
+        key_hex: settings.crypto_key.clone(),
+        client_name: format!("{}-{}", settings.client_name, suffix),
+        password: settings.redis_password.clone(),
+        watch_projects: vec![project.to_string()],
+        send_to: project.to_string(),
     }
 }
 
-/// Serve one client connection until it disconnects or errors.
-async fn run_session(
-    mut framed: Framed<TcpStream, LengthDelimitedCodec>,
-    peer: SocketAddr,
-    settings: Settings,
-    ui: super::ui::UiState,
-) {
-    info!("new client connected: {}", peer);
-
-    // One-shot auth handshake before any recording happens. The server presents a fresh
-    // session id; the client must echo back sha256(id + password). If no valid greeting
-    // arrives within the timeout we drop the connection outright.
-    let session_id = Uuid::new_v4();
-    if framed.send(Message::greeting(session_id).encode()).await.is_err() {
-        info!("send greeting to {} failed, ending session", peer);
-        return;
-    }
-
-    if !authenticate(&mut framed, session_id, peer, &settings.password).await {
-        info!("auth failed for {}, ending session", peer);
-        return;
-    }
-
-    // New authenticated client: deliver the lesson text (if configured) right away.
-    if !settings.lesson_data.is_empty() {
-        let lesson = Message { id: Uuid::nil(), text: settings.lesson_data.clone(), audio: Bytes::new() };
-        match framed.send(lesson.encode()).await {
-            Ok(_) => info!("sent lesson to {} ({} chars)", peer, settings.lesson_data.len()),
-            Err(e) => { warn!("failed to send lesson to {}: {}", peer, e); return; }
-        }
-    }
-
+/// Run the fully synchronous service loop on a dedicated OS thread.
+pub fn run_server(settings: Settings, ui: UiState) {
+    // Warn up front if no mic is available.
     let host = cpal::default_host();
     let Some(input_device) = host.default_input_device() else {
-        warn!("no default input device, session ends without recording");
+        warn!("no default input device found; recording will be skipped");
         return;
     };
 
-    // Input config is stable for the lifetime of a device handle.
     let (channels, sample_rate): (u16, u32) = match input_device.default_input_config() {
         Ok(c) => (c.channels(), c.sample_rate()),
-        Err(e) => { error!("input config error for {}: {}", peer, e); return; }
+        Err(e) => { error!("input config error: {}", e); return; }
     };
 
-    // Playback worker owns a MixerDeviceSink (rodio >= 0.21 API) on its own OS thread.
-    let playback_tx = start_playback_worker(channels, sample_rate);
+    // Open audio output once for the lifetime of this thread.
+    let device_sink = match DeviceSinkBuilder::open_default_sink() {
+        Ok(v) => v,
+        Err(e) => { error!("failed to open audio output: {}", e); return; }
+    };
+    let mixer = device_sink.mixer();
 
-    // The session is live from here on; reflect that in the UI so the toggle becomes active.
-    ui.set_connected(true);
+    // Create datatraffic clients for both projects.
+    let dialogue_cfg = make_config(&settings, "lesson-dialogue", "dlg");
+    let ready_cfg = make_config(&settings, "ready-state", "rdy");
+
+    info!(
+        "connecting to datatraffic (redis_url='{}', client={})",
+        if settings.redis_url.is_empty() { "(env REDIS_URL)" } else { &settings.redis_url },
+        settings.client_name
+    );
+
+    let mut dialogue_client = match Client::new(&dialogue_cfg) {
+        Ok(c) => c,
+        Err(e) => { error!("failed to create dialogue client: {}", e); return; }
+    };
+    let mut ready_client = match Client::new(&ready_cfg) {
+        Ok(c) => c,
+        Err(e) => { error!("failed to create ready-state client: {}", e); return; }
+    };
+
+    info!("datatraffic clients connected (lesson-dialogue + ready-state)");
+
+    // Send the initial greeting/lesson once; sayteacher acks it with a "lesson-set" frame.
+    let mut last_greeting = Instant::now();
+    let mut lesson_confirmed = false;
+    if !settings.lesson_data.is_empty() {
+        match ready_client.send("greeting", &settings.lesson_data, &[]) {
+            Ok(_) => info!("sent initial greeting ({} chars)", settings.lesson_data.len()),
+            Err(e) => warn!("failed to send initial greeting: {}", e),
+        }
+    }
+
+    let mut last_hb: Option<Instant> = None;
 
     loop {
-        // Per-interval channels: async side pushes client frames into the recorder thread.
-        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        let mut pending_playback: Vec<PendingAudio> = Vec::new();
-        let mut client_gone = false;
+        // 1. Poll both clients for inbound frames.
+        let mut pending_playback = handle_inbound(
+            &mut dialogue_client, &mut ready_client,
+            sample_rate, channels, &ui, &mut last_hb, &mut lesson_confirmed,
+        );
 
-        // Muted cycle: no mic capture; process one client frame (if any) then a short service wait.
-        if ui.is_muted() {
-            debug!("muted: skipping mic capture this cycle");
-            match tokio::time::timeout(Duration::from_millis((MUTE_INTERVAL_SECS * 1000.0) as u64), framed.next()).await {
-                Ok(Some(Ok(raw))) => handle_client_frame(&raw, sample_rate, channels, &mut pending_playback, &ui),
-                Ok(Some(Err(e))) => { warn!("frame read error from {}: {}", peer, e); client_gone = true; },
-                Ok(None) => client_gone = true,
-                Err(_) => { /* timeout: re-check mute state */ },
+        // Restart requested by the user ("Try again"): re-send the lesson immediately and reset
+        // confirmation so sayteacher (waiting after quit) receives it and acks with "lesson-set".
+        if ui.is_restart_requested() {
+            info!("restart requested by user, re-sending lesson");
+            if !settings.lesson_data.is_empty() {
+                match ready_client.send("greeting", &settings.lesson_data, &[]) {
+                    Ok(_) => debug!("re-sent greeting after restart ({} chars)", settings.lesson_data.len()),
+                    Err(e) => warn!("failed to re-send greeting after restart: {}", e),
+                }
+            }
+            lesson_confirmed = false;
+            last_greeting = Instant::now();
+            ui.set_restart_requested(false);
+        }
+
+        // Check heartbeat staleness: if no hb for >25s, mark disconnected and drop the
+        // lesson confirmation so a restarted sayteacher receives the lesson again.
+        if let Some(lh) = last_hb {
+            if lh.elapsed() >= Duration::from_secs(HB_STALENESS_SECS) {
+                ui.set_connected(false);
+                lesson_confirmed = false;
+                debug!("sayteacher heartbeat stale (>{}s), marking disconnected", HB_STALENESS_SECS);
+            }
+        }
+
+        // 2. Re-send the greeting/lesson until sayteacher confirms it has the lesson.
+        if !settings.lesson_data.is_empty() && !lesson_confirmed
+            && last_greeting.elapsed() >= Duration::from_secs(GREETING_INTERVAL_SECS) {
+            match ready_client.send("greeting", &settings.lesson_data, &[]) {
+                Ok(_) => debug!("re-sent greeting ({} chars)", settings.lesson_data.len()),
+                Err(e) => warn!("failed to re-send greeting: {}", e),
+            }
+            last_greeting = Instant::now();
+        }
+
+        // 3. Play back any audio received from sayteacher during this cycle (before recording).
+        let had_playback = !pending_playback.is_empty();
+        play_pending(mixer, &mut pending_playback, channels, sample_rate);
+
+        // If we just played audio, skip recording and start a fresh capture next iteration.
+        if had_playback {
+            debug!("playback in progress: skipping mic capture this cycle");
+            continue;
+        }
+
+        // 4. Record from mic (unless muted).
+        if !ui.is_muted() {
+            match record_interval(&input_device, settings.delay, settings.level.threshold(), &ui) {
+                Ok(result) => {
+                    let muted_at_send = ui.is_muted();
+                    if should_emit(&result, muted_at_send) {
+                        // Downmix and resample to 16 kHz mono for whisper.
+                        let mono = downmix_mono(&result.samples, channels);
+                        let clip = resample(&mono, sample_rate, TARGET_SAMPLE_RATE);
+                        let n_in = result.samples.len();
+                        let msg_bytes: Vec<u8> = clip.iter().flat_map(|s| s.to_le_bytes()).collect();
+
+                        info!(
+                            "sending recording to sayteacher ({} -> {} samples @ {} Hz, ~{:.2}s)",
+                            n_in, clip.len(), TARGET_SAMPLE_RATE,
+                            clip.len() as f64 / TARGET_SAMPLE_RATE as f64
+                        );
+                        if let Err(e) = dialogue_client.send("a", "", &msg_bytes) {
+                            warn!("failed to send recording: {}", e);
+                        }
+                    } else if !result.samples.is_empty() && muted_at_send {
+                        debug!(
+                            "mute active at send moment: skipping ~{:.2}s of captured audio",
+                            result.samples.len() as f64 / sample_rate as f64 / channels as f64
+                        );
+                    } else if !result.samples.is_empty() && result.silent {
+                        debug!(
+                            "recording has little useful signal (~{:.2}s), skipping send",
+                            result.samples.len() as f64 / sample_rate as f64 / channels as f64
+                        );
+                    }
+                },
+                Err(e) => error!("recording failed: {}", e),
             }
         } else {
-            let device_for_thread = input_device.clone();
-            let delay = settings.delay;
-            let threshold = settings.level.threshold();
-            // Clone before the closure so `ui` stays usable on the next loop iteration.
-            let ui_for_record = ui.clone();
-
-            let mut rec_handle = tokio::task::spawn_blocking(move || {
-                record_on_thread(&device_for_thread, delay, threshold, frame_rx, ui_for_record)
-            });
-            // Forward client frames while the recorder runs. The recorder decides when to stop:
-            // it ends on trailing silence (after the minimum interval), hits a safety cap, or as
-            // soon as one client frame reaches it. We race against the recorder and only await its
-            // result once below.
-            let mut finished: Option<Result<Result<IntervalResult, String>, tokio::task::JoinError>> = None;
-
-            tokio::select! {
-                res = &mut rec_handle => finished = Some(res),
-                frame = framed.next() => match frame {
-                    Some(Ok(b)) => {
-                        if frame_tx.send(b.to_vec()).is_err() {
-                            client_gone = true;
-                        }
-                    },
-                    Some(Err(e)) => { warn!("frame read error from {}: {}", peer, e); client_gone = true; },
-                    None => client_gone = true,
-                },
-            }
-
-            drop(frame_tx);
-            let joined = match finished {
-                Some(res) => res,
-                None => rec_handle.await,
-            };
-            let result = match joined {
-                Ok(Ok(r))  => r,
-                Ok(Err(e)) => { error!("recorder thread failed: {}", e); break; },
-                Err(e) => { error!("recorder task panicked/joined with error: {}", e); break; },
-            };
-
-            // Last gate: if Mute was pressed after the recorder started, do not emit a
-            // transport frame for this capture even though we have samples. Playback of any
-            // queued client audio below still happens as usual.
-            let muted_at_send = ui.is_muted();
-
-            if should_emit(&result, client_gone, muted_at_send) {
-                // Whisper input only needs about 16 kHz mono, so downmix and resample first.
-                let mono = downmix_mono(&result.samples, channels);
-                let clip = resample(&mono, sample_rate, TARGET_SAMPLE_RATE);
-                let n_in = result.samples.len();
-                let msg_bytes: Vec<u8> = clip.iter().flat_map(|s| s.to_le_bytes()).collect();
-                // Prefix the audio with an 'a' marker so receivers know this is a plain audio frame.
-                let id = Uuid::new_v4();
-                let message = Message {
-                    id,
-                    text: String::new(),
-                    audio: Message::audio_with_kind(MessageKind::Audio, &msg_bytes)
-                };
-                info!(
-                    "recording sent to {} (id={}, {} -> {} samples @ {} Hz, ~{:.2}s)",
-                    peer, id, n_in, clip.len(), TARGET_SAMPLE_RATE,
-                    clip.len() as f64 / TARGET_SAMPLE_RATE as f64
-                );
-                if let Err(e) = framed.send(message.encode()).await {
-                    warn!("send error to {}: {}", peer, e);
-                    break;
-                }
-            } else if !result.samples.is_empty() && muted_at_send {
-                debug!(
-                    "mute active at send moment: skipping ~{:.2}s of captured audio",
-                    result.samples.len() as f64 / sample_rate as f64 / channels as f64
-                );
-            } else if !result.samples.is_empty() && result.silent {
-                debug!(
-                    "recording has little useful signal (~{:.2}s), skipping send",
-                    result.samples.len() as f64 / sample_rate as f64 / channels as f64
-                );
-            }
-
-            pending_playback = result.pending_playback;
-        }
-
-        play_pending(&playback_tx, pending_playback);
-
-        if client_gone {
-            info!("client gone, stopping session for {}", peer);
-            break;
+            // Muted: short sleep instead of recording.
+            debug!("muted: skipping mic capture this cycle");
+            std::thread::sleep(Duration::from_millis(MUTE_INTERVAL_MS));
         }
     }
-
-    // Drop the worker sender so its channel closes and the thread exits, then mark idle in UI.
-    drop(playback_tx);
-    ui.set_connected(false);
-    info!("client disconnected: {}", peer);
-}
-
-/// Reject a new connection when one is already active: write a short marker then close.
-async fn reject_busy(stream: TcpStream, peer: SocketAddr) {
-    let mut f = Framed::new(stream, LengthDelimitedCodec::new());
-    warn!("busy, rejecting new connection from {}", peer);
-    if let Err(e) = f.send(Bytes::from_static(b"busy")).await {
-        debug!("failed to write busy marker to {}: {}", peer, e);
-    }
-}
-
-/// Run the single-client TCP server: bind once and keep accepting, one session at a time.
-pub async fn run_server(settings: Settings, ui: super::ui::UiState) {
-    // Warn up front if no mic is available.
-    if cpal::default_host().default_input_device().is_none() {
-        warn!("no default input device found; recording will be skipped per session");
-    }
-
-    let listener = match TcpListener::bind(settings.listen_addr()).await {
-        Ok(l) => l,
-        Err(e) => { error!("failed to bind {}: {}", settings.listen_addr(), e); return; },
-    };
-    match listener.local_addr() {
-        Ok(addr) => info!("listening on {} (record every {}s, one client at a time)", addr, settings.delay),
-        Err(e) => warn!("could not read local address: {}", e),
-    };
-
-    // Single-client server: only one active session at any moment.
-    let mut active: Option<JoinHandle<()>> = None;
-
-    loop {
-        // Reap a finished session so the slot opens up for the next client.
-        if let Some(h) = &active {
-            if h.is_finished() {
-                active.take();
-            }
-        }
-
-        let (stream, peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => { error!("accept failed: {}", e); break; },
-        };
-
-        match &active {
-            // A client is already connected: reject and drop the newcomer.
-            Some(_) => {
-                if let Err(e) = tokio::spawn(reject_busy(stream, peer)).await {
-                    warn!("busy-reject task failed: {}", e);
-                }
-            },
-            None => active = Some(tokio::spawn(run_session(
-                Framed::new(stream, LengthDelimitedCodec::new()),
-                peer,
-                settings.clone(),
-                ui.clone(),
-            ))),
-        }
-    }
-
-    drop(active);
 }
 
 #[cfg(test)]
@@ -684,6 +546,7 @@ mod tests {
             assert_eq!(out[i], out[i + 1]); // both channels carry the same mono signal
         }
     }
+
     #[test]
     fn downmix_single_channel_is_noop() {
         let mono = vec![0.1, 0.2];
@@ -733,27 +596,25 @@ mod tests {
     }
 
     fn sample_result(silent: bool) -> IntervalResult {
-        IntervalResult { samples: vec![0.5f32; 16_000], pending_playback: Vec::new(), silent }
+        IntervalResult { samples: vec![0.5f32; 16_000], silent }
     }
 
     #[test]
     fn emit_when_audio_present_and_not_muted() {
-        assert!(should_emit(&sample_result(false), false, false));
+        assert!(should_emit(&sample_result(false), false));
     }
 
     #[test]
     fn regression_do_not_emit_inflight_capture_if_mute_pressed_at_send() {
         // Recording started before Mute was pressed; by the time we build/send the frame Mute is on.
-        assert!(!should_emit(&sample_result(false), false, true));
+        assert!(!should_emit(&sample_result(false), true));
     }
 
     #[test]
-    fn do_not_emit_silent_or_empty_or_client_gone() {
+    fn do_not_emit_silent_or_empty() {
         let silent = sample_result(true);
-        let empty = IntervalResult { samples: Vec::new(), pending_playback: Vec::new(), silent: false };
-        assert!(!should_emit(&silent, false, false));
-        assert!(!should_emit(&empty, false, false));
-        assert!(!should_emit(&sample_result(false), true, false));
+        let empty = IntervalResult { samples: Vec::new(), silent: false };
+        assert!(!should_emit(&silent, false));
+        assert!(!should_emit(&empty, false));
     }
-
 }

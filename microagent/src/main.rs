@@ -1,3 +1,4 @@
+mod datatraffic;
 mod service;
 mod settings;
 mod tools;
@@ -7,8 +8,7 @@ use log::info;
 use settings::Settings;
 use ui::{MicroagentApp, UiState, window_title_from_lesson};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let settings = Settings::from_args();
 
@@ -19,26 +19,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if settings.client {
-        let auth = !settings.password.is_empty();
         info!(
-            "mode=client connect={} delay={}s level={} auth={}",
-            settings.connect_addr_str(),
-            settings.delay,
-            settings.level,
-            auth
+            "mode=client delay={}s level={}",
+            settings.delay, settings.level
         );
-        tools::run_client(settings).await?;
+        tools::run_client(settings)?;
     } else {
         // One clone for the server thread, one for the egui window. Both share the same Arc-backed state.
         let ui_server = UiState::default();
         let ui_app = ui_server.clone();
-        // Server runs on its own thread + runtime so the egui event loop owns the main thread.
+
+        // Server runs on its own OS thread (fully synchronous, no tokio).
         let builder = std::thread::Builder::new().name("server".into());
         let _handle = builder.spawn(move || {
-            match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt.block_on(service::run_server(settings, ui_server)),
-                Err(e) => log::error!("failed to build server runtime: {}", e),
-            }
+            service::run_server(settings, ui_server);
         }).expect("failed to spawn server thread");
 
         // Wider default so two text columns (notes + dialogue) fit comfortably side by side.
