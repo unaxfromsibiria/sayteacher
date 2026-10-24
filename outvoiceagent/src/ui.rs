@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Number of recognized text groups (by group_id) kept in memory.
@@ -130,8 +130,6 @@ impl UiState {
 /// Transparent, always-on-top overlay pinned to the bottom of the screen.
 pub struct OverlayApp {
     ui: UiState,
-    /// Set by the server on SIGINT/SIGTERM; when true the window closes for a clean exit.
-    shutdown: Arc<AtomicBool>,
     /// Current subtitle scroll position (px); advanced each frame so text drifts up like credits.
     scroll_offset: f32,
     /// Timestamp of the previous frame, used to compute dt for smooth scrolling.
@@ -144,19 +142,13 @@ pub struct OverlayApp {
 }
 
 impl OverlayApp {
-    pub fn new(ui: UiState, shutdown: Arc<AtomicBool>) -> Self {
-        Self { ui, shutdown, scroll_offset: 0.0, last_update: Instant::now(), max_scroll: 0.0 }
+    pub fn new(ui: UiState) -> Self {
+        Self { ui, scroll_offset: 0.0, last_update: Instant::now(), max_scroll: 0.0 }
     }
 }
 
 impl eframe::App for OverlayApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Graceful shutdown requested (SIGINT/SIGTERM): close the window so the process exits cleanly.
-        if self.shutdown.load(Ordering::Relaxed) {
-            ui.ctx().send_viewport_cmd(egui::viewport::ViewportCommand::Close);
-            return;
-        }
-
         let ctx = ui.ctx().clone();
         // Share the context so the server thread can repaint the overlay the moment
         // a new recognition arrives instead of waiting for the periodic timer.

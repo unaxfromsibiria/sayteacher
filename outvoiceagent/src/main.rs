@@ -1,3 +1,4 @@
+mod datatraffic;
 mod service;
 mod settings;
 mod tools;
@@ -5,43 +6,35 @@ mod ui;
 
 use log::info;
 use settings::Settings;
-use std::sync::{Arc, atomic::AtomicBool};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let settings = Settings::from_args();
 
     if settings.check_mode() {
         info!(
-            "mode=check dir={} connect={}",
+            "mode=check dir={} redis={}",
             settings.check_dir,
-            settings.connect_addr_str(),
+            settings.redis_url,
         );
-        tools::run_check(settings.clone(), std::path::PathBuf::from(&settings.check_dir)).await?;
+        tools::run_check(settings.clone(), std::path::PathBuf::from(&settings.check_dir))?;
     } else if settings.client {
         info!(
-            "mode=client connect={} delay={:.1}s",
-            settings.connect_addr_str(),
+            "mode=client redis={} delay={:.1}s",
+            settings.redis_url,
             settings.delay,
         );
-        tools::run_client(settings).await?;
+        tools::run_client(settings)?;
     } else {
-        info!("mode=server listen={} delay={:.1}s", settings.listen_addr(), settings.delay);
+        info!("mode=server redis={} delay={:.1}s", settings.redis_url, settings.delay);
 
-        // One clone for the server thread, one for the egui overlay window; both share Arc-backed state.
+        // One clone for the server thread, one for the egui overlay window.
         let ui_server = ui::UiState::default();
         let ui_app = ui_server.clone();
-        // Shared shutdown flag: set by the server on SIGINT/SIGTERM so the overlay can close cleanly.
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_for_server = shutdown.clone();
 
-        // Server runs on its own thread + runtime so the egui event loop owns the main thread.
+        // Server runs on its own plain thread (synchronous datatraffic loop).
         std::thread::Builder::new().name("server".into()).spawn(move || {
-            match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt.block_on(service::run_server(settings, ui_server, shutdown_for_server)),
-                Err(e) => log::error!("failed to build server runtime: {}", e),
-            }
+            service::run_server(settings, ui_server);
         }).expect("failed to spawn server thread");
 
         let mut vp = egui::ViewportBuilder::default().with_title("outvoiceagent")
@@ -59,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = eframe::run_native(
             "outvoiceagent",
             options,
-            Box::new(|_cc| Ok(Box::new(ui::OverlayApp::new(ui_app, shutdown)))),
+            Box::new(|_cc| Ok(Box::new(ui::OverlayApp::new(ui_app)))),
         ) {
             log::warn!("overlay window closed with error: {}", e);
         }

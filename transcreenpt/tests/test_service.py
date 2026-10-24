@@ -400,15 +400,11 @@ def test_split_sentences_multiple_boundaries():
 @pytest.mark.asyncio
 async def test_recognition_service_process_without_model():
     svc = RecognitionService("test", model="", from_lang="english", to_lang="english")
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(10))
+    await svc.process_segment("test", "0", _fake_audio(10))
     outbox = svc.outboxes["test"]
-    kind, text, payload = await asyncio.wait_for(outbox.get(), timeout=1)
-    assert kind == 0x74  # 't'
+    group_id, text = await asyncio.wait_for(outbox.get(), timeout=1)
+    assert group_id == 1
     assert text == ""
-    # payload starts with 't' byte + group counter
-    assert payload[:1] == b"t"
-    counter = int.from_bytes(payload[1:5], "little")
-    assert counter == 1
 
 
 def test_worker_transcribe_passes_beam_size():
@@ -439,7 +435,7 @@ def test_num_beams_clamped_to_one():
 @pytest.mark.asyncio
 async def test_recognition_service_reset():
     svc = RecognitionService("t", model="")
-    await svc.process_segment("t", b"\x00" * 16, _fake_audio())
+    await svc.process_segment("t", "0", _fake_audio())
     await svc.reset_session("t")
     buf = svc._buffers["t"]
     assert buf.group_id == 0
@@ -461,7 +457,7 @@ async def test_reset_clears_stale_audio_files():
 @pytest.mark.asyncio
 async def test_reset_without_audio_dir_keeps_state_clean():
     svc = RecognitionService("t", model="")
-    await svc.process_segment("t", b"\x00" * 16, _fake_audio())
+    await svc.process_segment("t", "0", _fake_audio())
     outbox = svc.outboxes["t"]
     assert not outbox.empty()
     await svc.reset_session("t")
@@ -546,10 +542,10 @@ async def test_process_segment_translates_when_configured():
     )
     fake = _FakeExecutor()
     svc._executor = fake
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(400))
+    await svc.process_segment("test", "0", _fake_audio(400))
     outbox = svc.outboxes["test"]
-    kind, text, payload = await asyncio.wait_for(outbox.get(), timeout=1)
-    assert kind == 0x74
+    group_id, text = await asyncio.wait_for(outbox.get(), timeout=1)
+    assert group_id == 1
     # translation replaced the recognized text before sending
     assert text == TRANSLATED_TEXT
     names = [c[0] for c in fake.calls]
@@ -564,10 +560,10 @@ async def test_process_segment_no_translate_when_model_empty():
     )
     fake = _FakeExecutor()
     svc._executor = fake
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(400))
+    await svc.process_segment("test", "0", _fake_audio(400))
     outbox = svc.outboxes["test"]
-    kind, text, payload = await asyncio.wait_for(outbox.get(), timeout=1)
-    assert kind == 0x74
+    group_id, text = await asyncio.wait_for(outbox.get(), timeout=1)
+    assert group_id == 1
     # no translation: the recognized text is sent as-is
     assert text == RECOGNIZED_TEXT
     names = [c[0] for c in fake.calls]
@@ -593,10 +589,10 @@ async def test_process_segment_no_translate_when_target_english():
     )
     fake = _FakeExecutor()
     svc._executor = fake
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(400))
+    await svc.process_segment("test", "0", _fake_audio(400))
     outbox = svc.outboxes["test"]
-    kind, text, payload = await asyncio.wait_for(outbox.get(), timeout=1)
-    assert kind == 0x74
+    group_id, text = await asyncio.wait_for(outbox.get(), timeout=1)
+    assert group_id == 1
     # English target: the recognized text is sent as-is
     assert text == RECOGNIZED_TEXT
     names = [c[0] for c in fake.calls]
@@ -611,10 +607,10 @@ async def test_process_segment_no_translate_when_target_empty():
     )
     fake = _FakeExecutor()
     svc._executor = fake
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(400))
+    await svc.process_segment("test", "0", _fake_audio(400))
     outbox = svc.outboxes["test"]
-    kind, text, payload = await asyncio.wait_for(outbox.get(), timeout=1)
-    assert kind == 0x74
+    group_id, text = await asyncio.wait_for(outbox.get(), timeout=1)
+    assert group_id == 1
     # empty target: the recognized text is sent as-is
     assert text == RECOGNIZED_TEXT
     names = [c[0] for c in fake.calls]
@@ -629,10 +625,10 @@ async def test_process_segment_validation_disabled():
     fake = _FakeExecutor()
     fake.results["_worker_transcribe"] = "aaaaaa" * 10  # letter run: fails the ratio check
     svc._executor = fake
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(400))
+    await svc.process_segment("test", "0", _fake_audio(400))
     outbox = svc.outboxes["test"]
-    kind, text, payload = await asyncio.wait_for(outbox.get(), timeout=1)
-    assert kind == 0x74
+    group_id, text = await asyncio.wait_for(outbox.get(), timeout=1)
+    assert group_id == 1
     # the (bad) recognized text is sent as-is because validation was skipped.
     assert text == "aaaaaa" * 10
 
@@ -645,7 +641,7 @@ async def test_process_segment_validation_enabled_rejects():
     fake = _FakeExecutor()
     fake.results["_worker_transcribe"] = "aaaaaa" * 10
     svc._executor = fake
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(400))
+    await svc.process_segment("test", "0", _fake_audio(400))
     outbox = svc.outboxes["test"]
     assert outbox.empty()
 
@@ -664,10 +660,10 @@ async def test_process_segment_recognizes_latest_and_translates_accumulated():
     ])
     svc._executor = fake
 
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(400))
+    await svc.process_segment("test", "0", _fake_audio(400))
     first = await asyncio.wait_for(svc.outboxes["test"].get(), timeout=1)
 
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(500))
+    await svc.process_segment("test", "0", _fake_audio(500))
     second = await asyncio.wait_for(svc.outboxes["test"].get(), timeout=1)
 
     # ASR calls: the second must receive only segment B (500 samples), not A+B (900).
@@ -678,10 +674,10 @@ async def test_process_segment_recognizes_latest_and_translates_accumulated():
     assert second_samples.size == 500
 
     # Step 1 carries only segment A; step 2 accumulates both segments (translated).
-    _, first_msg, _ = first
+    _, first_msg = first
     assert "the teacher explained the new lesson clearly" in first_msg
     assert "students asked several questions about it later" not in first_msg
-    _, msg_text, _ = second
+    _, msg_text = second
     assert "the teacher explained the new lesson clearly" in msg_text
     assert "students asked several questions about it later" in msg_text
 
@@ -693,8 +689,8 @@ async def test_process_segment_empty_recognition_keeps_slot_aligned():
     fake = _SeqExecutor(["", "the teacher explained the new lesson clearly"])
     svc._executor = fake
 
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(400))  # silence -> empty text
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(500))  # valid
+    await svc.process_segment("test", "0", _fake_audio(400))  # silence -> empty text
+    await svc.process_segment("test", "0", _fake_audio(500))  # valid
 
     buf = svc._buffers["test"]
     assert buf.filled_count() == 2
@@ -710,8 +706,8 @@ async def test_process_segment_rejected_keeps_slot_aligned():
     fake = _SeqExecutor(["aaaaaa" * 10, "the teacher explained the new lesson clearly"])
     svc._executor = fake
 
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(400))  # letter run -> rejected
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(500))  # valid
+    await svc.process_segment("test", "0", _fake_audio(400))  # letter run -> rejected
+    await svc.process_segment("test", "0", _fake_audio(500))  # valid
 
     buf = svc._buffers["test"]
     assert buf.filled_count() == 2
@@ -733,11 +729,11 @@ async def test_process_segment_translates_per_sentence_with_cache():
     ])
     svc._executor = fake
 
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(400))
+    await svc.process_segment("test", "0", _fake_audio(400))
     first_msg = (await asyncio.wait_for(svc.outboxes["test"].get(), timeout=1))[1]
     assert first_msg == "TR[And may I see this storage facility?]"
 
-    await svc.process_segment("test", b"\x00" * 16, _fake_audio(500))
+    await svc.process_segment("test", "0", _fake_audio(500))
     second_msg = (await asyncio.wait_for(svc.outboxes["test"].get(), timeout=1))[1]
     # every sentence of the accumulated group is present, in order.
     assert second_msg == "TR[And may I see this storage facility?] TR[No.] TR[And why not, Mr.] TR[Beckman?]"
@@ -763,7 +759,7 @@ async def test_translation_cache_resets_on_new_group():
     svc._executor = fake
 
     for _ in range(4):
-        await svc.process_segment("test", b"\x00" * 16, _fake_audio(400))
+        await svc.process_segment("test", "0", _fake_audio(400))
         await asyncio.wait_for(svc.outboxes["test"].get(), timeout=1)
 
     buf = svc._buffers["test"]

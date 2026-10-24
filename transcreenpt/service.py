@@ -15,10 +15,8 @@ import numpy as np
 
 try:
     from .common import TARGET_SAMPLE_RATE
-    from .common import MessageKindEnum
 except ImportError:
     from common import TARGET_SAMPLE_RATE
-    from common import MessageKindEnum
 
 log = logging.getLogger("transcreenpt")
 
@@ -428,7 +426,7 @@ class RecognitionService:
         """Shut down the worker process pool, cancelling pending recognition tasks."""
         self._executor.shutdown(wait=False, cancel_futures=True)
 
-    async def process_segment(self, name: str, uid: bytes, audio: bytes) -> None:
+    async def process_segment(self, name: str, frame_name: str, audio: bytes) -> None:
         buf = self._buffers.get(name)
         if not buf:
             raise KeyError(name)
@@ -437,8 +435,7 @@ class RecognitionService:
         buf.add(audio)
 
         if not self.model_id:
-            payload = b"t" + self.counter_bytes(buf.group_id)
-            await outbox.put((int(MessageKindEnum.TRANSLATE), "", payload))
+            await outbox.put((buf.group_id, ""))
             return
 
         try:
@@ -522,8 +519,7 @@ class RecognitionService:
                     "translation took %.2fs for %s group=%d", time.perf_counter() - t0, name, buf.group_id,
                 )
 
-            payload = b"t" + self.counter_bytes(buf.group_id)
-            await outbox.put((int(MessageKindEnum.TRANSLATE), msg_text, payload))
+            await outbox.put((buf.group_id, msg_text))
             log.info(
                 "transcription for %s group=%d segment=%d words=%d text=%r src=%r",
                 name, buf.group_id, slot_index, count_words(msg_text), msg_text, text,
@@ -590,7 +586,4 @@ class RecognitionService:
             f.write(buf_io.getvalue())
         log.debug("saved audio to %s (%d bytes)", path, len(data))
 
-    @staticmethod
-    def counter_bytes(counter: int) -> bytes:
-        # 4-byte little endian usize representation
-        return counter.to_bytes(4, byteorder="little", signed=False)
+

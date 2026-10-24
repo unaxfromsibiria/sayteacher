@@ -16,7 +16,6 @@ test:
 	python -m pytest -vv ./sayteacher
 	python -m pytest -vv ./transcreenpt
 	cd microagent && cargo test
-	cd microagent-transport && cargo test
 	cd outvoiceagent && cargo test
 
 # Build the pydatatraffic wheel in its own Docker builder (vendor/datatraffic/Dockerfile),

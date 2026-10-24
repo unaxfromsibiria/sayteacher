@@ -1,6 +1,15 @@
 use std::fmt;
-use std::net::ToSocketAddrs;
 use std::str::FromStr;
+
+use super::datatraffic::Config as TrafficConfig;
+
+/// datatraffic project that carries captured audio segments (f32 LE mono @ 16 kHz).
+/// outvoiceagent publishes here; transcreenpt watches it.
+pub const AUDIO_PROJECT: &str = "out-audio";
+/// datatraffic project that carries translation groups back to the UI overlay.
+/// transcreenpt publishes one file per group (name = zero-padded counter, note = text);
+/// outvoiceagent watches it and routes each file to its UI group.
+pub const TEXT_PROJECT: &str = "trans-text";
 
 /// Required signal level for a sound to be considered non-silent.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,21 +62,21 @@ pub struct Settings {
     pub delay: f64,
     /// Required signal level for non-silent detection (`--level low|middle|high`).
     pub level: SignalLevel,
-    /// TCP host to listen on (server mode). Default 127.0.0.1.
-    pub listen_host: String,
-    /// TCP port to listen on (default 16050).
-    pub listen_port: u16,
     /// When true the program runs as a test client instead of a server (`--connect`).
     pub client: bool,
-    /// Host of the outvoiceagent server in client mode. Default 127.0.0.1.
-    pub connect_host: String,
-    /// Port of the server in client mode (default 16050).
-    pub connect_port: u16,
     /// When set (non-empty), the program runs as a check client that saves received
-    /// output frames to WAV files in this directory (`--check /tmp/`).
+    /// audio segments to WAV files in this directory (`--check /tmp/`). Implies client mode.
     pub check_dir: String,
     /// Name of capture device; empty = auto-select (monitor on Linux, default output on Windows).
     pub device: String,
+    /// Redis connection URL for datatraffic (`--redis-url` / env `REDIS_URL`).
+    pub redis_url: String,
+    /// AES-256-GCM key as 64 hex chars (`--crypto-key` / env `CRYPTO_KEY`).
+    pub crypto_key: String,
+    /// Redis password (`--redis-password` / env `REDIS_PASSWORD`); empty = no auth.
+    pub redis_password: String,
+    /// Client identity registered with datatraffic (`--client-name`).
+    pub client_name: String,
 }
 
 impl Default for Settings {
@@ -75,13 +84,13 @@ impl Default for Settings {
         Self {
             delay: 6.,
             level: SignalLevel::Middle,
-            listen_host: "127.0.0.1".to_string(),
-            listen_port: 16050,
             client: false,
-            connect_host: "127.0.0.1".to_string(),
-            connect_port: 16050,
             check_dir: String::new(),
             device: String::new(),
+            redis_url: std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string()),
+            crypto_key: std::env::var("CRYPTO_KEY").unwrap_or_default(),
+            redis_password: std::env::var("REDIS_PASSWORD").unwrap_or_default(),
+            client_name: "outvoiceagent".to_string(),
         }
     }
 }
@@ -92,38 +101,56 @@ impl Settings {
         !self.check_dir.is_empty()
     }
 
-    /// Full socket address string used for `TcpListener::bind`.
-    pub fn listen_addr(&self) -> String {
-        format!("{}:{}", self.listen_host, self.listen_port)
+    /// datatraffic config for server mode: watch translation groups, publish captured audio.
+    pub fn server_config(&self) -> TrafficConfig {
+        TrafficConfig {
+            redis_url: self.redis_url.clone(),
+            key_hex: self.crypto_key.clone(),
+            client_name: self.client_name.clone(),
+            password: self.redis_password.clone(),
+            watch_projects: vec![TEXT_PROJECT.to_string()],
+            send_to: AUDIO_PROJECT.to_string(),
+        }
     }
 
-    /// `HOST:PORT` string the client connects to.
-    pub fn connect_addr_str(&self) -> String {
-        format!("{}:{}", self.connect_host, self.connect_port)
+    /// datatraffic config for test/check client mode: watch captured audio, publish nothing.
+    pub fn client_config(&self) -> TrafficConfig {
+        TrafficConfig {
+            redis_url: self.redis_url.clone(),
+            key_hex: self.crypto_key.clone(),
+            client_name: format!("{}-client", self.client_name),
+            password: self.redis_password.clone(),
+            watch_projects: vec![AUDIO_PROJECT.to_string()],
+            send_to: String::new(),
+        }
     }
 
     /// Full CLI help text for `-h` / `--help`.
     pub fn help_text() -> String {
-        "outvoiceagent — TCP server that captures system audio output and streams it to a client.
+        "outvoiceagent — captures system audio output and streams it over datatraffic (Redis).
 
 usage: outvoiceagent [options]
 
 Runs as a server by default; pass --connect to run the test client instead.
+Connection settings come from --redis-url/--crypto-key/--redis-password or the
+REDIS_URL/CRYPTO_KEY/REDIS_PASSWORD environment variables. CRYPTO_KEY is required.
 
 Options:
-  -h, --help            Show this help and exit.
-      --delay <SEC>     Capture interval in seconds; fractional allowed [default: 6]
-      --level <LVL>     Signal level low|middle|high for the silence threshold [default: middle]
-      --listen <ADDR>   Host:port to listen on (server) [default: 127.0.0.1:16050]
-      --connect <ADDR>  Server host:port for the test client mode [default: 127.0.0.1:16050]
-      --check <DIR>     Check mode: save received output frames to out_<uuid>.wav in DIR
-      --device <NAME>   Capture device name (Linux monitor, Windows loopback); auto = 'auto'
+  -h, --help              Show this help and exit.
+      --delay <SEC>       Capture interval in seconds; fractional allowed [default: 6]
+      --level <LVL>       Signal level low|middle|high for the silence threshold [default: middle]
+      --connect           Run as a test client that prints received audio segments
+      --check <DIR>       Check mode: save received audio segments to out_<id>.wav in DIR
+      --device <NAME>     Capture device name (Linux monitor, Windows loopback); auto = 'auto'
+      --redis-url <URL>   Redis URL [default: env REDIS_URL or redis://localhost:6379]
+      --crypto-key <KEY>  AES-256-GCM key, 64 hex chars [default: env CRYPTO_KEY]
+      --redis-password <P> Redis password [default: env REDIS_PASSWORD or empty]
+      --client-name <N>   datatraffic client identity [default: outvoiceagent]
 
 Examples:
-  outvoiceagent                            # server: capture loopback, send every 3.5s
-  outvoiceagent --listen 0.0.0.0:16050     # listen on all interfaces
-  outvoiceagent --connect 127.0.0.1:16050  # test client that prints received frames
-  outvoiceagent --check /tmp/               # check mode: save output frames as WAV files
+  outvoiceagent                            # server: capture loopback, publish every 6s to out-audio
+  outvoiceagent --connect                  # test client that prints received audio segments
+  outvoiceagent --check /tmp/              # check mode: save received segments as WAV files
 "
         .to_string()
     }
@@ -167,34 +194,17 @@ Examples:
                     }
                     i += 2;
                 },
-                "--listen" => {
-                    if i + 1 >= args.len() {
-                        log::error!("--listen requires a HOST:PORT value");
-                        std::process::exit(2);
-                    }
-                    let parsed = parse_addr(&args[i + 1]);
-                    settings.listen_host = format!("{}", parsed.ip());
-                    settings.listen_port = parsed.port();
-                    i += 2;
-                },
                 "--connect" => {
-                    if i + 1 >= args.len() {
-                        log::error!("--connect requires a HOST:PORT value");
-                        std::process::exit(2);
-                    }
-                    let parsed = parse_addr(&args[i + 1]);
-                    settings.connect_host = format!("{}", parsed.ip());
-                    settings.connect_port = parsed.port();
                     // Switching into client (test) mode.
                     settings.client = true;
-                    i += 2;
+                    i += 1;
                 },
                 "--check" => {
                     if i + 1 >= args.len() {
                         log::error!("--check requires a directory value");
                         std::process::exit(2);
                     }
-                    // Check mode implies client (test) mode: connect and save WAV files.
+                    // Check mode implies client (test) mode: listen and save WAV files.
                     settings.check_dir = args[i + 1].clone();
                     settings.client = true;
                     i += 2;
@@ -207,6 +217,38 @@ Examples:
                     settings.device = args[i + 1].clone();
                     i += 2;
                 },
+                "--redis-url" => {
+                    if i + 1 >= args.len() {
+                        log::error!("--redis-url requires a value");
+                        std::process::exit(2);
+                    }
+                    settings.redis_url = args[i + 1].clone();
+                    i += 2;
+                },
+                "--crypto-key" => {
+                    if i + 1 >= args.len() {
+                        log::error!("--crypto-key requires a value");
+                        std::process::exit(2);
+                    }
+                    settings.crypto_key = args[i + 1].clone();
+                    i += 2;
+                },
+                "--redis-password" => {
+                    if i + 1 >= args.len() {
+                        log::error!("--redis-password requires a value");
+                        std::process::exit(2);
+                    }
+                    settings.redis_password = args[i + 1].clone();
+                    i += 2;
+                },
+                "--client-name" => {
+                    if i + 1 >= args.len() {
+                        log::error!("--client-name requires a value");
+                        std::process::exit(2);
+                    }
+                    settings.client_name = args[i + 1].clone();
+                    i += 2;
+                },
                 other => {
                     log::warn!("ignoring unknown argument: {}", other);
                     i += 1;
@@ -214,19 +256,6 @@ Examples:
             }
         }
         settings
-    }
-}
-
-/// Resolve a `HOST:PORT` string to a socket address, logging and exiting on failure.
-fn parse_addr(value: &str) -> std::net::SocketAddr {
-    match value.to_socket_addrs().and_then(|mut it| {
-        it.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty socket address"))
-    }) {
-        Ok(a) => a,
-        Err(e) => {
-            log::error!("invalid address value '{}': {}", value, e);
-            std::process::exit(2);
-        }
     }
 }
 
@@ -239,9 +268,37 @@ mod tests {
         let s = Settings::default();
         assert!(s.delay > 0.0);
         assert_eq!(s.level, SignalLevel::Middle);
-        assert_eq!(s.listen_addr(), "127.0.0.1:16050");
-        assert_eq!(s.connect_addr_str(), "127.0.0.1:16050");
         assert!(!s.client);
+        assert!(!s.check_mode());
+        // Project names are fixed and distinct.
+        assert_ne!(super::AUDIO_PROJECT, super::TEXT_PROJECT);
+    }
+
+    #[test]
+    fn server_config_watches_text_and_publishes_audio() {
+        let s = Settings {
+            redis_url: "redis://example:6379".into(),
+            crypto_key: "ab".repeat(32),
+            client_name: "srv".into(),
+            ..Settings::default()
+        };
+        let cfg = s.server_config();
+        assert_eq!(cfg.watch_projects, vec![super::TEXT_PROJECT.to_string()]);
+        assert_eq!(cfg.send_to, super::AUDIO_PROJECT);
+        assert_eq!(cfg.redis_url, "redis://example:6379");
+        assert_eq!(cfg.client_name, "srv");
+    }
+
+    #[test]
+    fn client_config_watches_audio_and_publishes_nothing() {
+        let s = Settings {
+            client_name: "cli".into(),
+            ..Settings::default()
+        };
+        let cfg = s.client_config();
+        assert_eq!(cfg.watch_projects, vec![super::AUDIO_PROJECT.to_string()]);
+        assert!(cfg.send_to.is_empty());
+        assert_eq!(cfg.client_name, "cli-client");
     }
 
     #[test]
@@ -269,7 +326,10 @@ mod tests {
     #[test]
     fn help_text_lists_all_options() {
         let h = Settings::help_text();
-        for flag in ["--delay", "--level", "--listen", "--connect", "usage"] {
+        for flag in [
+            "--delay", "--level", "--connect", "--check", "--device",
+            "--redis-url", "--crypto-key", "usage",
+        ] {
             assert!(h.contains(flag), "missing '{}' in help text", flag);
         }
     }

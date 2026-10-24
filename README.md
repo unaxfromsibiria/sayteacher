@@ -111,7 +111,7 @@ Local LLM models (~30b) were used during development in a moderate and careful m
 
 ## Plans - what else I'd like to do
 
-- Remove `microagent-transport`, now deprecated in favor of datatraffic.
+- Done. Removed `microagent-transport`, now deprecated in favor of datatraffic.
 
 - Done. Switched to a faster speech recognition model and a more popular LLM API format.
 

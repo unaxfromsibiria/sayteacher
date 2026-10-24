@@ -1,17 +1,12 @@
-use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
-use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use super::settings::Settings;
+use super::datatraffic::{Client, DataFile};
+use super::settings::{Settings, AUDIO_PROJECT, TEXT_PROJECT};
 use super::ui::UiState;
-use microagent_transport::{Message, MessageKind, Uuid};
 
 /// Recognition downstream needs ~16 kHz mono (whisper), so resample before sending.
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
@@ -24,8 +19,9 @@ const MIN_SIGNAL_FILL_RATIO: f32 = 0.02; // min share of samples that carry real
 const WELL_FILLED_RATIO: f32 = 0.10; // fill ratio above which a segment counts as well filled
 const TEMP_FILL_RATIO: f32 = 0.005; // temporary low fill threshold after well-filled segments
 
-/// A sent ping without a reply for this long means the peer died behind an open socket.
-const PING_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a single inbound poll may block while we wait out the capture interval or extend it.
+/// Doubles as the sleep tick, so translation groups are routed to the UI within this window.
+const RECV_POLL_MS: u32 = 100;
 
 /// Fraction of mono samples whose |value| reaches `threshold` — cheap "is this real audio" test.
 fn mono_fill_ratio(mono: &[f32], threshold: f32) -> f32 {
@@ -336,90 +332,54 @@ fn drain_buffer(buffer: &Arc<Mutex<Vec<f32>>>) -> Vec<f32> {
     }
 }
 
-/// Decode one inbound transport frame and route recognized translation text to the UI overlay.
-/// Returns true when the frame was a ping reply, so callers can track peer liveness.
-fn handle_inbound(bytes: &[u8], ui: &UiState) -> bool {
-    match Message::decode(bytes) {
-        Ok(m) => {
-            if m.kind() == Some(MessageKind::Ping) {
-                debug!("ping reply from peer (id={})", m.id);
-                return true;
-            }
-            if m.kind() == Some(MessageKind::Translate) {
-                // The counter is a 4-byte little-endian usize after the 't' marker.
-                let body = m.audio_body();
-                let gid = if body.len() >= 4 {
-                    u32::from_le_bytes(body[0..4].try_into().unwrap())
-                } else {
-                    debug!("translation frame without a counter ({} bytes), ignoring", body.len());
-                    return false;
-                };
-
-                // Empty text means "no recognized words yet" — drop stale text for this group.
-                if m.text.is_empty() {
-                    ui.set_group_text(gid, "");
-                } else {
-                    let is_new = ui.set_group_text(gid, &m.text);
-                    info!(
-                        "{} recognition group {}: {} word(s), {} char(s): {}",
-                        if is_new { "new" } else { "updated" },
-                        gid,
-                        m.text.split_whitespace().count(),
-                        m.text.chars().count(),
-                        m.text
-                    );
-                }
-            } else if m.text.is_empty() {
-                debug!("inbound message id={} (no text, {} audio bytes)", m.id, m.audio.len());
-            } else {
-                info!("incoming text (id={}): {}", m.id, m.text);
-            }
-        },
-        Err(e) => warn!("undecodable inbound frame ({} bytes): {}", bytes.len(), e),
-    }
-    false
-}
-
-/// Send one empty ping frame to keep the peer's idle timer alive during silence.
-async fn send_ping(framed: &mut Framed<TcpStream, LengthDelimitedCodec>) -> bool {
-    let message = Message {
-        id: Uuid::new_v4(),
-        text: String::new(),
-        audio: Message::audio_with_kind(MessageKind::Ping, &[]),
+/// Route one inbound translation-group file to the UI overlay. The filename is a zero-padded group
+/// counter (e.g. "007"); an empty note clears that group's stale text, otherwise it sets/updates it.
+fn handle_inbound_group(file: &DataFile, ui: &UiState) {
+    let gid = match file.name.trim().parse::<u32>() {
+        Ok(g) => g,
+        Err(_) => {
+            debug!("translation file without a numeric name ({:?}), ignoring", file.name);
+            return;
+        }
     };
-    framed.send(message.encode()).await.is_ok()
+
+    if file.note.is_empty() {
+        ui.set_group_text(gid, "");
+        info!("cleared recognition group {}", gid);
+    } else {
+        let is_new = ui.set_group_text(gid, &file.note);
+        info!(
+            "{} recognition group {}: {} word(s), {} char(s): {}",
+            if is_new { "new" } else { "updated" },
+            gid,
+            file.note.split_whitespace().count(),
+            file.note.chars().count(),
+            file.note
+        );
+    }
 }
 
-/// Send one already-split segment: `mono` is f32 mono @ TARGET_SAMPLE_RATE.
-/// Returns false on a send error.
-async fn send_interval(
-    framed: &mut Framed<TcpStream, LengthDelimitedCodec>,
-    peer: SocketAddr,
-    mono: &[f32],
-) -> bool {
+/// Publish one already-split segment to the audio project. `mono` is f32 mono @ TARGET_SAMPLE_RATE;
+/// returns false on a send error. The filename is a short incrementing counter (id).
+fn send_segment(client: &Client, seq: u64, mono: &[f32]) -> bool {
     if mono.is_empty() {
         return true;
     }
 
     let bytes: Vec<u8> = mono.iter().flat_map(|s| s.to_le_bytes()).collect();
-    // Prefix with the 'o' marker so receivers know this is an output-device capture stream.
-    let id = Uuid::new_v4();
-    let message = Message {
-        id,
-        text: String::new(),
-        audio: Message::audio_with_kind(MessageKind::Output, &bytes),
-    };
-
-    let send_ok = framed.send(message.encode()).await.is_ok();
-    if send_ok {
-        info!(
-            "sent {} bytes of captured audio to {} (id={}, ~{:.2}s @ {} Hz)",
-            bytes.len(), peer, id, mono.len() as f64 / TARGET_SAMPLE_RATE as f64, TARGET_SAMPLE_RATE
-        );
-    } else {
-        warn!("send error to {}", peer);
+    match client.send(&seq.to_string(), "", &bytes) {
+        Ok(()) => {
+            info!(
+                "published {} bytes of captured audio to {} (id={}, ~{:.2}s @ {} Hz)",
+                bytes.len(), AUDIO_PROJECT, seq, mono.len() as f64 / TARGET_SAMPLE_RATE as f64, TARGET_SAMPLE_RATE
+            );
+        }
+        Err(e) => {
+            warn!("send error: {}", e);
+            return false;
+        }
     }
-    send_ok
+    true
 }
 
 /// Dynamic fill gate: after well-filled segments a temporary low fill threshold is armed,
@@ -455,16 +415,23 @@ impl FillGate {
     }
 }
 
-/// Serve one client connection until it disconnects or errors.
-async fn run_session(
-    mut framed: Framed<TcpStream, LengthDelimitedCodec>,
-    peer: SocketAddr,
-    settings: Settings,
-    ui: UiState,
-) {
-    info!("new client connected: {}", peer);
+/// Run the capture-and-publish loop: watch `trans-text` for translation groups (routed to the UI)
+/// and publish each captured, split audio segment to `out-audio`. Runs until the process exits.
+pub fn run_server(settings: Settings, ui: UiState) {
+    let cfg = settings.server_config();
+    let mut client = match Client::new(&cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("failed to create datatraffic client ({}): {}", TEXT_PROJECT, e);
+            return;
+        }
+    };
+    info!(
+        "outvoiceagent server: watching {} for translation groups, publishing captured audio to {} every {:.1}s",
+        TEXT_PROJECT, AUDIO_PROJECT, settings.delay
+    );
 
-    // A fresh session must not show text left over from the previous transcreenpt run.
+    // A fresh run must not show text left over from the previous transcreenpt session.
     ui.clear_groups();
 
     let host = cpal::default_host();
@@ -481,7 +448,7 @@ async fn run_session(
     let config = match device.default_input_config().or_else(|_| device.default_output_config()) {
         Ok(c) => c,
         Err(e) => {
-            error!("config error for {}: {}", peer, e);
+            error!("config error: {}", e);
             return;
         },
     };
@@ -501,70 +468,42 @@ async fn run_session(
         },
     };
     if let Err(e) = capture.play() {
-        error!("{}: {}", peer, e);
+        error!("{}", e);
         return;
     }
 
     info!(
-        "capturing output device '{}' @ {} Hz ({} ch), sending every {:.1}s to {}",
-        device_name, sample_rate, channels, settings.delay, peer
+        "capturing output device '{}' @ {} Hz ({} ch), publishing every {:.1}s",
+        device_name, sample_rate, channels, settings.delay
     );
 
     let delay = Duration::from_secs_f64(settings.delay);
-    // Short poll used once we've crossed the minimum interval, so extension stops promptly.
-    const EXTEND_POLL: Duration = Duration::from_millis(100);
     // Audio captured in the previous cycle but not yet sent — carried to the front of this one.
     // Carry is always mono @ TARGET_SAMPLE_RATE.
     let mut carry: Vec<f32> = Vec::new();
     // Dynamic fill gate so the low-fill tail of speech is not dropped.
     let mut fill_gate = FillGate::new();
-    // Set when a ping goes out, cleared once the peer answers it; an unanswered ping older than
-    // PING_REPLY_TIMEOUT means the peer died behind an open socket and the slot must be freed.
-    let mut pending_ping_since: Option<tokio::time::Instant> = None;
+    // Short id/counter for each published audio segment (datatraffic filename).
+    let mut audio_seq: u64 = 0;
 
-    'session: loop {
-        if let Some(since) = pending_ping_since {
-            if tokio::time::Instant::now() - since > PING_REPLY_TIMEOUT {
-                warn!("no ping reply from {} within {:?}, ending session", peer, PING_REPLY_TIMEOUT);
-                break 'session;
-            }
-        }
-
-        // True once an audio segment leaves this cycle; otherwise a ping keeps the peer alive.
-        let mut sent_audio = false;
-
-        // Phase 1a: wait out the full `delay` of capture. Inbound frames (the downstream translation
-        // replies) are logged but do NOT end the wait — we keep sleeping for whatever time remains on
-        // a fixed deadline, so a reply arriving at ~1 s no longer truncates the segment to ~1-2 s.
-        // Only a read-error or disconnect ends it.
-        let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        // Phase 1a: wait out the full `delay` of capture. Inbound translation groups are routed to
+        // the UI as they arrive but do NOT end the wait — recv blocks up to RECV_POLL_MS and doubles
+        // as the sleep tick, so a reply arriving early no longer truncates the segment.
+        let deadline = Instant::now() + delay;
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            tokio::select! {
-                _ = tokio::time::sleep(remaining) => break,
-                frame = framed.next() => match frame {
-                    Some(Ok(b)) => { // keep waiting for the deadline
-                        if handle_inbound(&b, &ui) {
-                            pending_ping_since = None; // ping answered — peer is alive
-                        }
-                    },
-                    Some(Err(e)) => {
-                        warn!("frame read error from {}: {}", peer, e);
-                        break 'session;
-                    }
-                    None => {
-                        info!("client {} closed the connection", peer);
-                        break 'session;
-                    }
-                },
+            let poll_ms = (remaining.as_millis().min(RECV_POLL_MS as u128)) as u32;
+            if let Some(file) = client.recv(poll_ms.max(1)) {
+                handle_inbound_group(&file, &ui);
             }
         }
 
         // Phase 1b: minimum reached — extend while a recent tail still has signal above threshold,
-        // polling every 100 ms so we stop as soon as silence appears. Hard cap at delay * 1.4
+        // polling every RECV_POLL_MS so we stop as soon as silence appears. Hard cap at delay * 1.4
         // mirrors microagent's MAX_RECORD_FACTOR and keeps endless speech from starving the split.
         let min_sec = settings.delay;
         let max_sec = settings.delay * 1.4;
@@ -581,27 +520,12 @@ async fn run_session(
                     total_sec,
                     max_sec
                 );
+                // Poll for inbound translation groups; the recv block doubles as the extend sleep.
+                if let Some(file) = client.recv(RECV_POLL_MS) {
+                    handle_inbound_group(&file, &ui);
+                }
             } else {
                 break;
-            }
-
-            tokio::select! {
-                _ = tokio::time::sleep(EXTEND_POLL) => {},
-                frame = framed.next() => match frame {
-                    Some(Ok(b)) => {
-                        if handle_inbound(&b, &ui) {
-                            pending_ping_since = None; // ping answered — peer is alive
-                        }
-                    },
-                    Some(Err(e)) => {
-                        warn!("frame read error from {}: {}", peer, e);
-                        break 'session;
-                    }
-                    None => {
-                        info!("client {} closed the connection", peer);
-                        break 'session;
-                    }
-                },
             }
         }
 
@@ -622,11 +546,7 @@ async fn run_session(
         trim_leading_silence(&mut carry, delay_samples, settings.level.threshold());
 
         if carry.is_empty() {
-            debug!("no audio captured this interval, sending ping instead");
-            if !send_ping(&mut framed).await {
-                break 'session;
-            }
-            pending_ping_since = Some(tokio::time::Instant::now());
+            debug!("no audio captured this interval");
             continue;
         }
 
@@ -664,15 +584,14 @@ async fn run_session(
             );
             if fill_gate.check(peak, fill, threshold) {
                 info!(
-                    "segment useful (peak={:.4}, fill={:.1}%), sending ~{:.2}s",
+                    "segment useful (peak={:.4}, fill={:.1}%), publishing ~{:.2}s",
                     peak,
                     fill * 100.0,
                     head.len() as f64 / TARGET_SAMPLE_RATE as f64
                 );
-                if send_interval(&mut framed, peer, &head).await {
-                    sent_audio = true;
-                } else {
-                    break 'session;
+                audio_seq += 1;
+                if !send_segment(&client, audio_seq, &head) {
+                    break;
                 }
             } else {
                 debug!(
@@ -681,10 +600,6 @@ async fn run_session(
                     peak,
                     fill * 100.0
                 );
-            }
-            if !sent_audio {
-                if !send_ping(&mut framed).await { break 'session; }
-                pending_ping_since = Some(tokio::time::Instant::now());
             }
             carry.clear();
             continue;
@@ -723,15 +638,14 @@ async fn run_session(
 
         if fill_gate.check(peak, fill, threshold) {
             info!(
-                "segment useful (peak={:.4}, fill={:.1}%), sending ~{:.2}s",
+                "segment useful (peak={:.4}, fill={:.1}%), publishing ~{:.2}s",
                 peak,
                 fill * 100.0,
                 head.len() as f64 / TARGET_SAMPLE_RATE as f64
             );
-            if send_interval(&mut framed, peer, head).await {
-                sent_audio = true;
-            } else {
-                break 'session;
+            audio_seq += 1;
+            if !send_segment(&client, audio_seq, head) {
+                break;
             }
         } else {
             debug!(
@@ -749,180 +663,44 @@ async fn run_session(
                 carry.len() as f64 / TARGET_SAMPLE_RATE as f64
             );
         }
-
-        // Silence (or a rejected low-fill tail): keep the peer's idle timer alive with a ping.
-        if !sent_audio {
-            if !send_ping(&mut framed).await { break 'session; }
-            pending_ping_since = Some(tokio::time::Instant::now());
-        }
     }
 
-    // Stop the capture stream once the client is gone.
+    // Stop the capture stream once we exit (process teardown).
     drop(capture);
-    info!("session ended for {}", peer);
 }
 
-/// Reject a new connection when one is already active: close it (no busy marker needed here).
-async fn reject_busy(stream: TcpStream, peer: SocketAddr) {
-    warn!("busy, rejecting new connection from {}", peer);
-    drop(stream);
-}
-
-/// Accept one client and either start its session or reject it when the slot is busy.
-/// Returns false to stop the accept loop (accept error).
-async fn handle_accept(
-    active: &mut Option<JoinHandle<()>>,
-    res: std::io::Result<(TcpStream, SocketAddr)>,
-    settings: &Settings,
-    ui: &UiState,
-) -> bool {
-    let (stream, peer) = match res {
-        Ok(v) => v,
-        Err(e) => { error!("accept failed: {}", e); return false; },
-    };
-    match *active {
-        Some(_) => {
-            if let Err(e) = tokio::spawn(reject_busy(stream, peer)).await {
-                warn!("busy-reject task failed: {}", e);
-            }
-        },
-        None => {
-            *active = Some(tokio::spawn(run_session(
-                Framed::new(stream, LengthDelimitedCodec::new()),
-                peer,
-                settings.clone(),
-                ui.clone(),
-            )));
-        },
-    }
-    true
-}
-
-/// Run the single-client TCP server: bind once and keep accepting, one session at a time.
-/// On SIGINT/SIGTERM it stops accepting, ends any active session, sets `shutdown`, and returns.
-pub async fn run_server(settings: Settings, ui: UiState, shutdown: Arc<AtomicBool>) {
-    let listener = match TcpListener::bind(settings.listen_addr()).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!("failed to bind {}: {}", settings.listen_addr(), e);
-            return;
-        },
-    };
-    if let Ok(addr) = listener.local_addr() {
-        info!("outvoiceagent listening on {} (send captured output every {:.1}s)", addr, settings.delay);
-    }
-
-    // Graceful shutdown: SIGINT + SIGTERM on unix, Ctrl+C elsewhere.
-    #[cfg(unix)]
-    let mut sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(e) => { error!("failed to install SIGINT handler: {}", e); return; },
-    };
-    #[cfg(unix)]
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => { error!("failed to install SIGTERM handler: {}", e); return; },
-    };
-    #[cfg(not(unix))]
-    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
-
-    let mut active: Option<JoinHandle<()>> = None;
-
-    loop {
-        // Reap a finished session so the slot opens up for the next client.
-        if let Some(h) = &active && h.is_finished() {
-            active.take();
-        }
-
-        #[cfg(unix)]
-        tokio::select! {
-            res = listener.accept() => { if !handle_accept(&mut active, res, &settings, &ui).await { break; } },
-            _ = sigint.recv() => { info!("received SIGINT, shutting down"); break; },
-            _ = sigterm.recv() => { info!("received SIGTERM, shutting down"); break; },
-        }
-
-        #[cfg(not(unix))]
-        tokio::select! {
-            res = listener.accept() => { if !handle_accept(&mut active, res, &settings, &ui).await { break; } },
-            _ = &mut ctrl_c => { info!("received Ctrl+C, shutting down"); break; },
-        }
-    }
-
-    // Tell the overlay to close so the process exits through its normal path.
-    shutdown.store(true, Ordering::Relaxed);
-    if let Some(h) = active.take() {
-        h.abort();
-        info!("active session ended on shutdown");
-    }
-}
 #[cfg(test)]
 mod tests {
-    use microagent_transport::{Message, Uuid};
-    use tokio_util::bytes::Bytes;
-
     use super::{
-        downmix_mono, find_best_pause, mono_fill_ratio, peak_amplitude, resample, signal_onset,
-        split_band, trim_leading_silence, FillGate, TAIL_SEARCH_FRACTION, TARGET_SAMPLE_RATE,
+        downmix_mono, find_best_pause, handle_inbound_group, mono_fill_ratio, peak_amplitude,
+        resample, signal_onset, split_band, trim_leading_silence, FillGate, TAIL_SEARCH_FRACTION,
+        TARGET_SAMPLE_RATE,
     };
+    use crate::datatraffic::DataFile;
     use crate::ui::UiState;
 
     #[test]
-    fn handle_inbound_routes_translate_frames_to_ui() {
+    fn handle_inbound_group_routes_translation_files_to_ui() {
         let ui = UiState::default();
-        // Build a translate frame the way transcreenpt sends it: 't' + 4-byte LE group counter.
-        let mut audio = vec![b't'];
-        audio.extend_from_slice(&7u32.to_le_bytes());
-
-        let msg = Message {
-            id: Uuid::new_v4(),
-            text: "привет мир, как дела".into(),
-            audio: Bytes::from(audio),
-        };
-        super::handle_inbound(&msg.encode(), &ui);
+        // A translation group file: name is the zero-padded counter, note is the text.
+        let file = DataFile { name: "007".into(), note: "привет мир, как дела".into(), data: Vec::new() };
+        handle_inbound_group(&file, &ui);
         assert_eq!(ui.combined_text(), "привет мир, как дела");
 
         // A shorter refresh for the same group is a stale/delayed result and must not clobber it.
-        let msg2 = Message {
-            id: Uuid::new_v4(),
-            text: "привет мир".into(),
-            audio: Bytes::from(vec![b't', 0x07, 0x00, 0x00, 0x00]),
-        };
-        super::handle_inbound(&msg2.encode(), &ui);
+        let file2 = DataFile { name: "007".into(), note: "привет мир".into(), data: Vec::new() };
+        handle_inbound_group(&file2, &ui);
         assert_eq!(ui.combined_text(), "привет мир, как дела");
 
-        // A frame without the translate marker is not routed to a group.
-        let msg3 = Message {
-            id: Uuid::new_v4(),
-            text: "plain note".into(),
-            audio: Bytes::new(),
-        };
-        super::handle_inbound(&msg3.encode(), &ui);
+        // A file without a numeric name is not routed to any group.
+        let file3 = DataFile { name: "plain".into(), note: "note text".into(), data: Vec::new() };
+        handle_inbound_group(&file3, &ui);
         assert_eq!(ui.combined_text(), "привет мир, как дела");
 
-        // An empty translate frame clears the group's stale text.
-        let msg4 = Message {
-            id: Uuid::new_v4(),
-            text: String::new(),
-            audio: Bytes::from(vec![b't', 0x07, 0x00, 0x00, 0x00]),
-        };
-        super::handle_inbound(&msg4.encode(), &ui);
+        // An empty note clears the group's stale text.
+        let file4 = DataFile { name: "007".into(), note: String::new(), data: Vec::new() };
+        handle_inbound_group(&file4, &ui);
         assert_eq!(ui.combined_text(), "");
-    }
-
-    #[test]
-    fn handle_inbound_reports_ping_replies() {
-        let ui = UiState::default();
-        // A ping frame is exactly the 'p' marker with an empty payload.
-        let ping = Message {
-            id: Uuid::new_v4(),
-            text: String::new(),
-            audio: Bytes::from(vec![b'p']),
-        };
-        assert!(super::handle_inbound(&ping.encode(), &ui));
-
-        // Non-ping frames report false.
-        let note = Message { id: Uuid::nil(), text: "hi".into(), audio: Bytes::new() };
-        assert!(!super::handle_inbound(&note.encode(), &ui));
     }
 
     #[test]

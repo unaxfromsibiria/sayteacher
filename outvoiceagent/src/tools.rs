@@ -1,122 +1,120 @@
-use futures_util::StreamExt;
 use log::{debug, info, warn};
 use std::path::PathBuf;
-use std::time::Duration;
-use tokio::net::TcpStream;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+use super::datatraffic::Client;
 use super::settings::Settings;
 use super::service::TARGET_SAMPLE_RATE;
-use microagent_transport::{Message, MessageKind};
-/// How long to wait for the next frame before treating the link as idle and disconnecting.
-const IDLE_TIMEOUT_SECONDS: f64 = 180.0;
 
-/// Test client: connects to outvoiceagent and prints every transport frame it receives
-/// until the server closes the connection or nothing arrives within the idle timeout.
-pub async fn run_client(settings: Settings) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = settings.connect_addr_str();
-    info!("connecting to server at {}", addr);
+/// How long (in seconds) to wait for the next file before treating the link as idle and exiting.
+const IDLE_TIMEOUT_SECONDS: u64 = 180;
+/// Poll interval in milliseconds; doubles as the sleep tick between recv calls.
+const RECV_POLL_MS: u32 = 100;
 
-    let stream = TcpStream::connect(&addr).await.map_err(|e| format!(
-        "failed to connect to {}: {}", addr, e
-    ))?;
-    info!("connected to {}", addr);
+/// Test client: watches `out-audio` for captured audio segments and prints each one until
+/// nothing arrives within the idle timeout. Runs synchronously on the calling thread.
+pub fn run_client(settings: Settings) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = settings.client_config();
+    info!(
+        "connecting to datatraffic ({}), watching {}",
+        cfg.redis_url,
+        cfg.watch_projects.join(",")
+    );
 
-    let mut framed: Framed<TcpStream, LengthDelimitedCodec> = Framed::new(stream, LengthDelimitedCodec::new());
-    let idle_timeout = Duration::from_secs_f64(IDLE_TIMEOUT_SECONDS);
+    let mut client = Client::new(&cfg)
+        .map_err(|e| format!("failed to create datatraffic client: {}", e))?;
+    info!("connected");
+
+    // Consecutive timeouts (recv returns None) until we declare the link idle.
+    let max_idle_polls = IDLE_TIMEOUT_SECONDS * 1000 / RECV_POLL_MS as u64;
+    let mut idle_count: u64 = 0;
 
     loop {
-        // A single bounded await keeps the client from hanging on a silent server.
-        match tokio::time::timeout(idle_timeout, framed.next()).await {
-            Ok(Some(Ok(raw))) => log_inbound(&raw)?,
-            Ok(Some(Err(e))) => {
-                warn!("frame read error: {}", e);
-                break;
+        match client.recv(RECV_POLL_MS) {
+            Some(file) => {
+                idle_count = 0;
+                log_inbound(&file)?;
             }
-            Ok(None) => {
-                info!("server closed the connection");
-                break;
-            }
-            Err(_) => {
-                info!("no frame from server in {:.0}s, disconnecting", IDLE_TIMEOUT_SECONDS);
-                break;
+            None => {
+                idle_count += 1;
+                if idle_count >= max_idle_polls {
+                    info!(
+                        "no file from server in {:.0}s, disconnecting",
+                        IDLE_TIMEOUT_SECONDS as f64
+                    );
+                    break;
+                }
             }
         }
     }
 
+    client.close();
     info!("disconnected");
     Ok(())
 }
 
-/// Log a received transport frame: its text and/or captured audio payload.
-fn log_inbound(raw: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let msg = Message::decode(raw).map_err(
-        |e| format!("undecodable frame ({} bytes): {}", raw.len(), e)
-    )?;
-
-    if !msg.text.is_empty() {
-        info!("received text (id={}, kind={:?}): {}", msg.id, msg.kind(), msg.text);
-    } else if let Some(kind) = msg.kind() {
-        // Captured audio arrives at ~16 kHz mono f32: seconds ≈ bytes / 4 / 16_000.
-        let body_len = msg.audio_body().len();
-        let secs = body_len as f64 / 4.0 / 16_000.0;
-        info!("received audio (id={}, kind={:?}): {} bytes (~{:.2}s)", msg.id, kind, body_len, secs);
-    } else {
-        debug!("received empty frame (id={})", msg.id);
+/// Log a received audio segment: its name (id) and approximate duration.
+fn log_inbound(file: &super::datatraffic::DataFile) -> Result<(), Box<dyn std::error::Error>> {
+    let body_len = file.data.len();
+    if body_len == 0 {
+        debug!("received empty audio segment (name={})", file.name);
+        return Ok(());
     }
+
+    // f32 LE mono @ TARGET_SAMPLE_RATE: seconds ≈ bytes / 4 / rate.
+    let secs = body_len as f64 / 4.0 / TARGET_SAMPLE_RATE as f64;
+    info!(
+        "received audio (name={}): {} bytes (~{:.2}s)",
+        file.name, body_len, secs
+    );
 
     Ok(())
 }
 
-/// Check-mode client: connects to the server and saves every received output-frame
-/// ('o' marker) as a PCM16 mono WAV file named out_<uuid>.wav in `dir`. No playback.
-pub async fn run_check(settings: Settings, dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+/// Check-mode client: watches `out-audio` and saves every received segment as a PCM16 mono WAV
+/// file named out_<id>.wav in `dir`. No playback. Runs synchronously on the calling thread.
+pub fn run_check(settings: Settings, dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     if std::fs::create_dir_all(&dir).is_err() {
         warn!("could not create directory {}, saving to the current directory", dir.display());
     }
 
+    let cfg = settings.client_config();
     info!(
-        "check mode: saving output frames from {} into {} as out_<uuid>.wav",
-        settings.connect_addr_str(),
+        "check mode: watching {} ({}), saving segments into {} as out_<id>.wav",
+        cfg.watch_projects.join(","),
+        cfg.redis_url,
         dir.display()
     );
 
-    let addr = settings.connect_addr_str();
-    let stream = TcpStream::connect(&addr).await.map_err(|e| format!(
-        "failed to connect to {}: {}", addr, e
-    ))?;
-    info!("connected to {}", addr);
+    let mut client = Client::new(&cfg)
+        .map_err(|e| format!("failed to create datatraffic client: {}", e))?;
+    info!("connected");
 
-    let mut framed: Framed<TcpStream, LengthDelimitedCodec> = Framed::new(stream, LengthDelimitedCodec::new());
-    let idle_timeout = Duration::from_secs_f64(IDLE_TIMEOUT_SECONDS);
+    let max_idle_polls = IDLE_TIMEOUT_SECONDS * 1000 / RECV_POLL_MS as u64;
+    let mut idle_count: u64 = 0;
     let mut saved = 0usize;
 
     loop {
-        match tokio::time::timeout(idle_timeout, framed.next()).await {
-            Ok(Some(Ok(raw))) => {
-                if let Some(msg) = Message::decode(&raw).ok() {
-                    save_output_frame(&dir, &msg);
-                    saved += 1;
-                } else {
-                    warn!("undecodable frame ({} bytes), skipping", raw.len());
+        match client.recv(RECV_POLL_MS) {
+            Some(file) => {
+                idle_count = 0;
+                save_output_frame(&dir, &file);
+                saved += 1;
+            }
+            None => {
+                idle_count += 1;
+                if idle_count >= max_idle_polls {
+                    info!(
+                        "no file from server in {:.0}s, disconnecting",
+                        IDLE_TIMEOUT_SECONDS as f64
+                    );
+                    break;
                 }
-            },
-            Ok(Some(Err(e))) => {
-                warn!("frame read error: {}", e);
-                break;
-            }
-            Ok(None) => {
-                info!("server closed the connection");
-                break;
-            }
-            Err(_) => {
-                info!("no frame from server in {:.0}s, disconnecting", IDLE_TIMEOUT_SECONDS);
-                break;
             }
         }
     }
 
-    info!("disconnected; {} output frame(s) saved to {}", saved, dir.display());
+    client.close();
+    info!("disconnected; {} segment(s) saved to {}", saved, dir.display());
     Ok(())
 }
 
@@ -149,26 +147,25 @@ fn wav_from_samples(samples_f32: &[f32], sample_rate: u32) -> Vec<u8> {
     buf
 }
 
-/// When `msg` carries an 'o'-marked payload, write it as out_<uuid>.wav (PCM16 mono).
-fn save_output_frame(dir: &PathBuf, msg: &Message) {
-    if msg.kind() != Some(MessageKind::Output) || msg.audio_body().is_empty() {
+/// When `file` carries audio data, write it as out_<name>.wav (PCM16 mono @ TARGET_SAMPLE_RATE).
+fn save_output_frame(dir: &PathBuf, file: &super::datatraffic::DataFile) {
+    if file.data.is_empty() {
         return;
     }
 
     // f32 LE samples (outvoiceagent sends mono @ TARGET_SAMPLE_RATE); truncate any tail bytes.
-    let body = msg.audio_body();
+    let body = &file.data;
     let n = body.len() / 4;
     let samples: Vec<f32> = body[..n * 4].chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
     let buf = wav_from_samples(&samples, TARGET_SAMPLE_RATE);
-    let id = msg.id;
-    let path = dir.join(format!("out_{}.wav", id));
+    let path = dir.join(format!("out_{}.wav", file.name));
     match std::fs::write(&path, &buf) {
         Ok(()) => info!(
             "saved {} -> {} ({} bytes, ~{:.2}s)",
-            msg.id, path.display(), buf.len() - 44, n as f64 / TARGET_SAMPLE_RATE as f64
+            file.name, path.display(), buf.len() - 44, n as f64 / TARGET_SAMPLE_RATE as f64
         ),
         Err(e) => warn!("failed to write {}: {}", path.display(), e),
     }
@@ -177,7 +174,7 @@ fn save_output_frame(dir: &PathBuf, msg: &Message) {
 #[cfg(test)]
 mod tests {
     use super::{save_output_frame, wav_from_samples, TARGET_SAMPLE_RATE};
-    use microagent_transport::{Message, MessageKind, Uuid};
+    use crate::datatraffic::DataFile;
 
     #[test]
     fn wav_header_layout_is_riff_pcm16_mono() {
@@ -208,32 +205,25 @@ mod tests {
     }
 
     #[test]
-    fn save_output_frame_writes_only_o_frames() {
-        let dir = std::env::temp_dir().join(format!("outvoice_check_test_{}", Uuid::new_v4()));
+    fn save_output_frame_writes_audio_files() {
+        let dir = std::env::temp_dir().join(format!("outvoice_check_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
+        // A file with audio data -> one WAV file.
         let payload: Vec<u8> = [0.25f32, -0.25].iter().flat_map(|s| s.to_le_bytes()).collect();
+        let audio_file = DataFile { name: "42".into(), note: String::new(), data: payload };
+        save_output_frame(&dir, &audio_file);
 
-        // 'o' frame -> one WAV file; other kinds -> nothing.
-        let out_msg = Message {
-            id: Uuid::new_v4(),
-            text: String::new(),
-            audio: Message::audio_with_kind(MessageKind::Output, &payload),
-        };
-        save_output_frame(&dir, &out_msg);
-        let note_msg = Message {
-            id: Uuid::new_v4(),
-            text: "hi".into(),
-            audio: Message::audio_with_kind(MessageKind::Note, &payload),
-        };
-        save_output_frame(&dir, &note_msg);
+        // A file without audio data -> nothing saved.
+        let empty_file = DataFile { name: "43".into(), note: "text only".into(), data: Vec::new() };
+        save_output_frame(&dir, &empty_file);
 
         let files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
-        assert_eq!(files.len(), 1, "only the 'o' frame must be saved");
+        assert_eq!(files.len(), 1, "only the audio file must be saved");
         let name = files[0].file_name().to_string_lossy().into_owned();
         assert!(name.starts_with("out_") && name.ends_with(".wav"), "unexpected name: {}", name);
 
-        // The stored file is a valid WAV whose samples round-trip to 16-bit values.
+        // The stored file is a valid WAV whose sample rate matches TARGET_SAMPLE_RATE.
         let bytes = std::fs::read(&dir.join(name)).unwrap();
         assert_eq!(&bytes[..4], b"RIFF");
         assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), TARGET_SAMPLE_RATE);
