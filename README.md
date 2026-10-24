@@ -22,7 +22,7 @@ Serve one of the quantized GGUF models with llama.cpp (see below) and even the l
 
 ## Running
 
-Manual commands to launch the apps:
+Manual commands to launch the apps. Both connect to datatraffic via the `REDIS_URL` / `CRYPTO_KEY` (required) / `REDIS_PASSWORD` environment variables:
 
 First app (UI):
 
@@ -56,6 +56,8 @@ Beyond one-on-one practice with an LLM teacher, you can follow along with any En
 - **outvoiceagent** - a small transparent overlay that captures your system's audio output (loopback) and displays translated text scrolling like subtitles.
 - **transcreenpt** - a background service performing speech recognition (faster-whisper) and real-time translation into the target language of your choice. Multiple languages are supported.
 
+They exchange data over the same datatraffic library: audio segments flow `outvoiceagent → transcreenpt` (project `out-audio`) and translated text flows back (project `trans-text`).
+
 Together they turn any English audio into live bilingual subtitles on your screen.
 
 ![German subtitles](files/tr_deu.jpg)
@@ -70,15 +72,15 @@ Download the speech model once (if not already present):
 hf download distil-whisper/distil-medium.en
 ```
 
-Then launch both components:
+Then launch both components. They connect to datatraffic via the `REDIS_URL` / `CRYPTO_KEY` (required) / `REDIS_PASSWORD` environment variables:
 
 ```bash
 # Terminal 1 - subtitle overlay (captures system audio, displays translated text)
 cd outvoiceagent
-RUST_LOG=info cargo run -- --listen 0.0.0.0:16050 --device auto --delay 4.5
+REDIS_URL=redis://localhost:6379 CRYPTO_KEY=<hex> RUST_LOG=info cargo run -- --device auto --delay 4.5
 
 # Terminal 2 - recognition + translation service
-HF_HUB_OFFLINE=1 python -m transcreenpt.main --model 'distil-medium.en' --debug --tolang german --parallel 2
+HF_HUB_OFFLINE=1 REDIS_URL=redis://localhost:6379 CRYPTO_KEY=<hex> python -m transcreenpt.main --model 'distil-medium.en' --debug --tolang german --parallel 2
 ```
 
 Both support `--help` for the full list of options (target language, model, parallelism, etc.).
@@ -96,7 +98,8 @@ docker compose exec sayteacher-api bash -c 'HF_HUB_OFFLINE=0 hf download distil-
 For example, everything I had to specify:
 
 ```text
-      - CONNECT=10.1.1.2:16050
+      - REDIS_URL=redis://10.1.1.2:6379
+      - CRYPTO_KEY=<hex>
       - LLM_MODEL=/models/Huihui-gemma-4-12B-it-abliterated.Q4_K_M.gguf
       - LLM_API=http://10.1.1.3:8080/v1
 ```
